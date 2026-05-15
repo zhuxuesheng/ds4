@@ -21,8 +21,10 @@
 #endif
 
 // Tables defined in ds4.c (for IQ2XXS dequant)
-extern const uint8_t ksigns_iq2xs[128];
-extern const uint64_t iq2xxs_grid[256];
+// Weak definitions allow ds4_xeon.o to link standalone for tests;
+// when linked with ds4.c the strong definitions take precedence.
+__attribute__((weak)) const uint8_t ksigns_iq2xs[128] = {0};
+__attribute__((weak)) const uint64_t iq2xxs_grid[256] = {0};
 
 // ============================================================================
 // Utility
@@ -390,13 +392,15 @@ void ds4_xeon_matmul_a16w16_vnni_batch(
 // Activation Quantization
 // ============================================================================
 
-// Per-block INT8 quantization (Q8_0 style)
-// 32-element blocks, each block gets its own float32 scale.
-// Block max → scale = max/127.0, values = round(x/scale), clamped to [-128,127].
+// Per-block INT8 quantization (Q8_0 style).
+// Each block of `block_size` elements gets its own float32 scale.
+// block_size must be a multiple of 16 (one ZMM register holds 16 floats).
+// Uses AVX-512 for max-finding (reduce_max) and quantization (round+pack).
 void ds4_xeon_quantize_a8_per_block(int8_t *out, float *scale,
     const float *in, int n_tok, int in_dim, int block_size)
 {
     const int n_blocks = in_dim / block_size;
+    const int n16 = block_size / 16;  // 16-element chunks per block
 
     #pragma omp parallel for
     for (int t = 0; t < n_tok; t++) {
@@ -405,82 +409,89 @@ void ds4_xeon_quantize_a8_per_block(int8_t *out, float *scale,
         float *scale_row = scale + (uint64_t)t * n_blocks;
 
         for (int b = 0; b < n_blocks; b++) {
-            const float *bin = in_row + b * block_size;
+            const float *bin = in_row + (uint64_t)b * block_size;
+            int8_t *bout = out_row + (uint64_t)b * block_size;
 
-            float amax = 1e-9f;
-            for (int i = 0; i < block_size; i++) {
-                float ax = fabsf(bin[i]);
-                if (ax > amax) amax = ax;
+            // Max-find over 16-element chunks
+            __m512 vmax = _mm512_set1_ps(0.0f);
+            for (int c = 0; c < n16; c++) {
+                __m512 v = _mm512_loadu_ps(bin + c * 16);
+                vmax = _mm512_max_ps(vmax, _mm512_abs_ps(v));
             }
-
-            float d = amax / 127.0f;
-            float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
-            scale_row[b] = d;
-
-            for (int i = 0; i < block_size; i++) {
-                float v = bin[i] * id;
-                if (v > 127.0f) v = 127.0f;
-                if (v < -128.0f) v = -128.0f;
-                out_row[b * block_size + i] = (int8_t)lrintf(v);
-            }
-        }
-    }
-}
-
-// AVX-512 accelerated per-block INT8 quantization
-void ds4_xeon_quantize_a8_per_block_avx512(int8_t *out, float *scale,
-    const float *in, int n_tok, int in_dim, int block_size)
-{
-    const int n_blocks = in_dim / block_size;
-
-    #pragma omp parallel for
-    for (int t = 0; t < n_tok; t++) {
-        const float *in_row = in + (uint64_t)t * in_dim;
-        int8_t *out_row = out + (uint64_t)t * in_dim;
-        float *scale_row = scale + (uint64_t)t * n_blocks;
-
-        for (int b = 0; b < n_blocks; b++) {
-            const float *bin = in_row + b * block_size;
-            // block_size = 32 fits exactly in one ZMM register
-            __m512 v = _mm512_loadu_ps(bin);
-            __m512 vabs = _mm512_abs_ps(v);
-            float amax = _mm512_reduce_max_ps(vabs);
+            float amax = _mm512_reduce_max_ps(vmax);
             if (amax < 1e-9f) amax = 1e-9f;
 
             float d = amax / 127.0f;
             float id = 1.0f / d;
             scale_row[b] = d;
 
-            __m512 scaled = _mm512_mul_ps(v, _mm512_set1_ps(id));
-            __m512i iv = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT));
-            // Pack 32×int32 → 32×int8 (saturating)
-            __m256i iv16 = _mm512_cvtsepi32_epi16(iv);
-            __m128i iv8  = _mm256_cvtsepi16_epi8(iv16);
-            _mm_storeu_si128((__m128i*)(out_row + b * block_size), iv8);
+            // Quantize: F32 → int8 via round + saturating pack
+            __m512 vid = _mm512_set1_ps(id);
+            for (int c = 0; c < n16; c++) {
+                __m512 v = _mm512_loadu_ps(bin + c * 16);
+                __m512 scaled = _mm512_mul_ps(v, vid);
+                __m512i iv = _mm512_cvtps_epi32(
+                    _mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT));
+                __m128i iv8 = _mm256_cvtsepi16_epi8(
+                    _mm512_cvtsepi32_epi16(iv));
+                _mm_storeu_si128((__m128i*)(bout + c * 16), iv8);
+            }
         }
     }
 }
 
-// Per-token INT16 quantization
+// AVX-512 accelerated per-block INT8 quantization (alias, kept for compatibility)
+void ds4_xeon_quantize_a8_per_block_avx512(int8_t *out, float *scale,
+    const float *in, int n_tok, int in_dim, int block_size)
+{
+    ds4_xeon_quantize_a8_per_block(out, scale, in, n_tok, in_dim, block_size);
+}
+
+// Per-token INT16 quantization.
+// One global scale per token vector. Uses AVX-512 for max-finding.
 void ds4_xeon_quantize_a16_per_token(int16_t *out, float *scale,
     const float *in, int n_tok, int in_dim)
 {
+    const int n16 = in_dim / 16;
+
     #pragma omp parallel for
     for (int t = 0; t < n_tok; t++) {
         const float *in_row = in + (uint64_t)t * in_dim;
         int16_t *out_row = out + (uint64_t)t * in_dim;
 
-        float max_val = 1e-9f;
-        for (int i = 0; i < in_dim; i++) {
-            float v = fabsf(in_row[i]);
-            if (v > max_val) max_val = v;
+        // Max-find over 16-element chunks
+        __m512 vmax = _mm512_set1_ps(0.0f);
+        for (int i = 0; i < n16; i++) {
+            __m512 v = _mm512_loadu_ps(in_row + i * 16);
+            vmax = _mm512_max_ps(vmax, _mm512_abs_ps(v));
         }
+        float max_val = _mm512_reduce_max_ps(vmax);
+        // Handle tail
+        for (int i = n16 * 16; i < in_dim; i++) {
+            float ax = fabsf(in_row[i]);
+            if (ax > max_val) max_val = ax;
+        }
+        if (max_val < 1e-9f) max_val = 1e-9f;
 
         float s = max_val / 32767.0f;
         float inv_s = 1.0f / s;
         scale[t] = s;
 
-        for (int i = 0; i < in_dim; i++) {
+        // Quantize: F32 → int16 (16 elements per iteration = 256 bits)
+        __m512 vid = _mm512_set1_ps(inv_s);
+        __m512 vmax_i16 = _mm512_set1_ps(32767.0f);
+        __m512 vmin_i16 = _mm512_set1_ps(-32768.0f);
+        for (int i = 0; i < n16; i++) {
+            __m512 v = _mm512_loadu_ps(in_row + i * 16);
+            v = _mm512_mul_ps(v, vid);
+            v = _mm512_min_ps(_mm512_max_ps(v, vmin_i16), vmax_i16);
+            __m512i iv32 = _mm512_cvtps_epi32(
+                _mm512_roundscale_ps(v, _MM_FROUND_TO_NEAREST_INT));
+            __m256i iv16 = _mm512_cvtsepi32_epi16(iv32);
+            _mm256_storeu_si256((__m256i*)(out_row + i * 16), iv16);
+        }
+        // Tail
+        for (int i = n16 * 16; i < in_dim; i++) {
             float v = in_row[i] * inv_s;
             if (v > 32767.0f) v = 32767.0f;
             if (v < -32768.0f) v = -32768.0f;
