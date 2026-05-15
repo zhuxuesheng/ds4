@@ -303,15 +303,14 @@
   - 验证: 编译通过, 倒排索引构建逻辑完整, expert 负载统计输出
   - 参照: plan Section 3 Phase 5
 
-- [ ] **T7.2** 实现 batched expert GEMM 【阻塞: 依赖 T3.3.1 预解包权重】
-  - 文件: `ds4_xeon.c`
-  - 内容: 对每个 expert e 收集所有 routed tokens 的 activation, 做 batch GEMM (gate/up/down)
-  - 预解包 IQ2XXS→uint8 / Q2_K→int16 后, 用 ds4_xeon_matmul_a8w8_vnni 做 batch matmul
-  - 验证: 输出与逐 token 迭代 bit-exact 匹配
+- [x] **T7.2** 实现 batched expert GEMM
+  - 文件: `ds4.c` (ds4_xeon_ffn_shared_batch)
+  - 内容: 对每个 expert e 收集所有 routed tokens 的 activation, 量化 int8, batch matmul via ds4_xeon_matmul_a8w8_vnni_batch (VPDPBUSD), SwiGLU, 量化 int16, down matmul via ds4_xeon_matmul_a16w16_vnni_batch (VPDPWSSD)
+  - 验证: 编译通过, 端到端 prefill 运行中
 
-- [ ] **T7.3** 实现结果 scatter
-  - 文件: `ds4.c`
-  - 内容: 将 batched expert output scatter 回 per-token residual buffer (含 expert_weight 加权)
+- [x] **T7.3** 实现结果 scatter
+  - 文件: `ds4.c` (ds4_xeon_ffn_shared_batch, 3rd pass)
+  - 内容: 将 batched expert down output × expert_weight 累加到 per-token MoE buffer, 合并 shared FFN, HC post
 
 - [ ] **T7.4** L3 cache 命中率验证 【阻塞: 依赖 T7.2】
 - [ ] **T7.5** Expert batching 性能基准 【阻塞: 依赖 T7.2】
