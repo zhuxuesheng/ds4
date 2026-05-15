@@ -70,6 +70,7 @@ typedef struct ds4_xeon_graph {
     float *f32_gate;        // [max_batch_size][DS4_N_FF_EXP]  expert gate output
     float *f32_up;          // [max_batch_size][DS4_N_FF_EXP]  expert up output
     float *f32_mid;         // [max_batch_size][DS4_N_FF_EXP]  SwiGLU mid (FP32)
+    float *f32_hc;          // [max_batch_size][DS4_N_HC]  host-context routing buffer
 
     // === MoE Routing ===
     float   *f32_router_logits; // [max_batch_size][DS4_N_EXPERT]
@@ -83,9 +84,14 @@ typedef struct ds4_xeon_graph {
     // Model dimensions (set at init)
     uint32_t n_embd;
     uint32_t n_ff_exp;
+    uint32_t n_hc;
     uint32_t n_expert;
     uint32_t n_expert_used;
     uint32_t n_layer;
+
+    // NUMA configuration
+    int  numa_nodes;         // number of NUMA nodes (0 if NUMA unavailable)
+    int  numa_node;          // NUMA node this graph is bound to (-1 = interleaved)
 } ds4_xeon_graph;
 
 // Opaque context for model data passed from ds4.c
@@ -166,8 +172,9 @@ void ds4_xeon_quantize_a16_per_token(int16_t *out, float *scale,
 // === Graph Lifecycle ===
 
 void ds4_xeon_graph_init(ds4_xeon_graph *g, uint32_t max_batch_size,
-    uint32_t n_embd, uint32_t n_ff_exp, uint32_t n_expert,
-    uint32_t n_expert_used, uint32_t n_layer);
+    uint32_t n_embd, uint32_t n_ff_exp, uint32_t n_hc,
+    uint32_t n_expert, uint32_t n_expert_used, uint32_t n_layer,
+    int numa_node);
 void ds4_xeon_graph_free(ds4_xeon_graph *g);
 
 // === High-Level Graph Execution ===
@@ -185,6 +192,13 @@ bool ds4_xeon_graph_eval_token(
     float *logits);
 
 // === Thread / NUMA Initialization ===
+// Detect NUMA topology and return number of NUMA nodes (0 if unavailable).
+int  ds4_xeon_numa_init(void);
+
+// Bind OpenMP threads to CPUs on the specified NUMA node.
+void ds4_xeon_threads_bind(int numa_node);
+
+// Initialize threads (legacy, delegates to bind with numa_node=0).
 void ds4_xeon_threads_init(void);
 
 // === Weight Pre-dequantization ===
@@ -196,5 +210,34 @@ int ds4_xeon_predequant_init(
     uint32_t n_layer, uint32_t n_embd, uint32_t n_ff_exp, uint32_t n_expert);
 
 void ds4_xeon_predequant_weights_free(ds4_xeon_predequant_weights *w);
+
+// === NUMA Expert Weight Replication ===
+// Per-socket replica of pre-dequantized expert weights.
+// On dual-socket systems, the same expert weights are replicated on each
+// socket's local memory to avoid cross-socket traffic during inference.
+typedef struct {
+    // Gate + up projections (int8 for VPDPBUSD), replicated per socket
+    // Layout: gate_up[node][n_expert][2 * n_blocks_per_expert * QK_K]
+    uint8_t **gate_up;      // [numa_nodes][total_gate_up_bytes]
+    // Down projections (int16 for VPDPWSSD), replicated per socket
+    int16_t **down;         // [numa_nodes][total_down_bytes]
+    // Sizes
+    size_t   gate_up_bytes; // per-socket gate+up buffer size in bytes
+    size_t   down_bytes;    // per-socket down buffer size in bytes
+    int      n_nodes;       // number of NUMA nodes (replicas)
+} ds4_xeon_expert_replica;
+
+// Allocate per-socket expert weight replicas.
+// Call after predequant_init to replicate the pre-dequantized weights.
+int ds4_xeon_expert_replica_init(
+    ds4_xeon_expert_replica *r,
+    const ds4_xeon_predequant_weights *src,
+    int n_nodes);
+
+void ds4_xeon_expert_replica_free(ds4_xeon_expert_replica *r);
+
+// === NUMA-Aware Allocator ===
+// Allocate memory on a specific NUMA node (Linux only, falls back to aligned_alloc).
+void *ds4_xeon_numa_alloc(size_t size, int node);
 
 #endif // DS4_XEON_H

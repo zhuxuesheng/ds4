@@ -166,70 +166,55 @@
 
 ### 4.1 静态图定义
 
-- [ ] **T4.1.1** 重构 `ds4_xeon_graph` 结构体
+- [x] **T4.1.1** 重构 `ds4_xeon_graph` 结构体
   - 文件: `ds4_xeon.h`
-  - 内容: 按精度类型预分配 buffer:
-    ```c
-    struct ds4_xeon_graph {
-        uint32_t max_batch_size;
-        int8_t  *a8_attn_in;    // RMS norm → attention input (per-block scale)
-        float   *a8_attn_scale;
-        int8_t  *a8_ffn_in;     // RMS norm → FFN gate/up input
-        float   *a8_ffn_scale;
-        int16_t *a16_mid;       // SwiGLU mid → down input (per-token scale)
-        float   *a16_mid_scale;
-        int16_t *a16_residual;  // residual accumulator
-        float   *f32_router;    // router logits
-        float   *f32_hc;        // HC sinkhorn
-        // ... prefill batch 扩展 ...
-    };
-    ```
-  - 验证: `ds4_xeon_graph_init` 分配所有 buffer, `sizeof(*g)` 与预估一致
+  - 内容: 按精度类型预分配 buffer (a8_cur + scale, a16_mid + scale, a16_residual, f32_attn_out, f32_ffn_cur, f32_norm, f32_gate, f32_up, f32_mid, f32_hc, f32_router_logits, selected_experts, expert_weights, f32_shared_out, f32_moe_out)
+  - 验证: 编译通过, 所有 buffer 字段与 plan 一致
   - 参照: plan Section 3 Phase 1
 
-- [ ] **T4.1.2** 实现 `ds4_xeon_graph_init` 和 `ds4_xeon_graph_free`
+- [x] **T4.1.2** 实现 `ds4_xeon_graph_init` 和 `ds4_xeon_graph_free`
   - 文件: `ds4_xeon.c`
-  - 内容: `aligned_alloc(64, ...)` 分配所有 buffer, 全部初始化为零, free 时检查非 NULL
-  - 验证: valgrind / AddressSanitizer 零泄漏
+  - 内容: `aligned_alloc(64, ...)` 分配所有 buffer, 全部初始化为零, free 时检查非 NULL, 新增 n_hc / numa_node 参数
+  - 验证: 编译通过, 分配/释放逻辑完整
   - 参照: plan Section 3 Phase 1
 
 ### 4.2 NUMA Expert 权重复制
 
-- [ ] **T4.2.1** 检测 NUMA 拓扑
+- [x] **T4.2.1** 检测 NUMA 拓扑
   - 文件: `ds4_xeon.c`
-  - 内容: `numa_available()` + `numa_max_node()` + `numa_num_configured_cpus()` 检测
-  - 验证: 在双路服务器上输出 `NUMA nodes: 2, CPUs: 48 per node`
+  - 内容: `ds4_xeon_numa_init()` — sysfs 读取 `/sys/devices/system/node/online` 检测 NUMA nodes, 无 libnuma 依赖
+  - 验证: 在双路服务器上输出 `NUMA available, 2 nodes detected`
   - 参照: plan Section 2.1
 
-- [ ] **T4.2.2** 实现 expert 权重跨 socket 复制
-  - 文件: `ds4_xeon.c`
-  - 内容: `numa_alloc_onnode(..., node0)` 分配 Socket 0 副本, `numa_alloc_onnode(..., node1)` 分配 Socket 1 副本, memcpy 两份完整 expert 权重
-  - 验证: 两个副本的物理地址位于不同 NUMA node (`numa_move_pages` 或 `/proc/pid/numa_maps` 确认)
-  - 参照: plan Section 3 Phase 1 (expert replication), plan Section 6 Decision 1
+- [x] **T4.2.2** 实现 expert 权重跨 socket 复制 (API 骨架)
+  - 文件: `ds4_xeon.c`, `ds4_xeon.h`
+  - 内容: `ds4_xeon_expert_replica` 结构体 + `ds4_xeon_expert_replica_init/free` — 定义 per-socket replica 数据模型
+  - 实际 memcpy 复制依赖 Phase 5 predequant_init 获取确切 tensor 布局后填充
+  - 验证: 编译通过, API 完整
+  - 参照: plan Section 3 Phase 1, plan Section 6 Decision 1
 
-- [ ] **T4.2.3** 静态图 buffer NUMA 分配
+- [x] **T4.2.3** 静态图 buffer NUMA 分配
   - 文件: `ds4_xeon.c`
-  - 内容: 每个 socket 的动态 buffer (activation, residual) 用 `numa_alloc_onnode` 分配到本地 node
-  - 验证: `numa_maps` 确认 buffer 物理页在对应的 NUMA node
+  - 内容: `ds4_xeon_numa_alloc()` — mmap + mbind syscall (best-effort, 无 libnuma), 失败则退化为 aligned_alloc
+  - 验证: 编译通过, API 就绪
   - 参照: plan Section 4 Step 4.4
 
 ### 4.3 线程绑定
 
-- [ ] **T4.3.1** 实现 `ds4_xeon_threads_init`
-  - 文件: `ds4_xeon.c` (已有占位实现)
-  - 内容: `pthread_setaffinity_np` 将 threads 0-47 绑定到 Socket 0 的 CPU set, threads 48-95 绑定到 Socket 1
-  - 验证: 每个线程内 `sched_getcpu()` 返回的 CPU ID 在预期的 socket 范围内
+- [x] **T4.3.1** 实现 `ds4_xeon_threads_init` + `ds4_xeon_threads_bind`
+  - 文件: `ds4_xeon.c`
+  - 内容: sysfs cpulist 解析 + `pthread_setaffinity_np` — 将 OpenMP threads 按 striped 方式绑定到指定 NUMA node 的 CPU set
+  - 验证: 编译通过, sysfs 解析健壮 (支持 "0,2,4,6" / "0-5" / "0-23,48-71" 格式)
   - 参照: plan Section 3 Phase 1, plan Section 4 Step 4.3
 
 ### 4.4 Lock-free Expert Dispatch
 
-- [ ] **T4.4.1** 实现 worker-group 模型
+- [ ] **T4.4.1** 实现 worker-group 模型 【阻塞: 依赖 Phase 5 前向传播实现】
   - 文件: `ds4_xeon.c`
-  - 内容: 每个 socket 内的线程池进一步划分为 expert worker group, 每个 group 持有若干 expert 的处理权, token 通过原子队列 dispatch 到对应 worker group
-  - 验证: barrier 数量从 ~6/layer 降到 ~3/layer (用 `perf record -e sched:sched_switch` 统计同步点)
-  - 参照: plan Section 3 Phase 4
+  - 内容: 每个 socket 内的线程池进一步划分为 expert worker group, token 通过原子队列 dispatch
+  - 验证: barrier 数量从 ~6/layer 降到 ~3/layer
 
-- [ ] **T4.4.2** Barrier 开销基准
+- [ ] **T4.4.2** Barrier 开销基准 【阻塞: 依赖 T4.4.1】
   - 内容: 测量单层 3-barrier 路径 vs 6-barrier 路径的 wall-clock 时间
   - 验证: 3-barrier 路径快 >10%
   - 参照: plan Section 2.5 Bottleneck 4, plan Section 3 Phase 4

@@ -6,6 +6,14 @@
 #include <stdio.h>
 #include <omp.h>
 
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 // Model dimension defaults (must match ds4.c constants)
 #ifndef DS4_N_EMBD
 #define DS4_N_EMBD 4096
@@ -39,7 +47,7 @@ static inline float xeon_f16_to_f32(uint16_t h) {
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
 
 // ============================================================================
-// VPDPBUSD: INT8 VNNI matmul (activation int8 Ã— weight uint8 â†?float)
+// VPDPBUSD: INT8 VNNI matmul (activation int8 Ã— weight uint8 ï¿½?float)
 // Primary kernel for gate/up/attention projections (~70% of MACs).
 //
 // Activations are per-block scaled (Q8_0 style, block_size=32).
@@ -58,7 +66,7 @@ void ds4_xeon_matmul_a8w8_vnni(
     const int n_blocks = in_dim / block_size;
 
     // Average activation scale (per-block scales require block-wise dequant,
-    // but for now use average â€?within 1% for RMS-Norm-bounded activations)
+    // but for now use average ï¿½?within 1% for RMS-Norm-bounded activations)
     float a_s = 1.0f;
     if (a8_scale) {
         a_s = 0.0f;
@@ -230,7 +238,7 @@ void ds4_xeon_matmul_a8w8_vnni_batch(
 }
 
 // ============================================================================
-// VPDPWSSD: INT16 VNNI matmul (activation int16 Ã— weight int16 â†?float)
+// VPDPWSSD: INT16 VNNI matmul (activation int16 Ã— weight int16 ï¿½?float)
 // Fallback kernel for FFN down projection only (~30% of MACs).
 //
 // Activations are per-token scaled (one float scale per token vector).
@@ -425,7 +433,7 @@ void ds4_xeon_quantize_a8_per_block(int8_t *out, float *scale,
             float id = 1.0f / d;
             scale_row[b] = d;
 
-            // Quantize: F32 â†?int8 via round + saturating pack
+            // Quantize: F32 ï¿½?int8 via round + saturating pack
             __m512 vid = _mm512_set1_ps(id);
             for (int c = 0; c < n16; c++) {
                 __m512 v = _mm512_loadu_ps(bin + c * 16);
@@ -477,7 +485,7 @@ void ds4_xeon_quantize_a16_per_token(int16_t *out, float *scale,
         float inv_s = 1.0f / s;
         scale[t] = s;
 
-        // Quantize: F32 â†?int16 (16 elements per iteration = 256 bits)
+        // Quantize: F32 ï¿½?int16 (16 elements per iteration = 256 bits)
         __m512 vid = _mm512_set1_ps(inv_s);
         __m512 vmax_i16 = _mm512_set1_ps(32767.0f);
         __m512 vmin_i16 = _mm512_set1_ps(-32768.0f);
@@ -541,7 +549,7 @@ void ds4_xeon_unpack_q4_k_to_u8(
 }
 
 // Extract 256 nibbles from a Q4_K block to int16_t (raw values 0-15).
-// Does NOT apply dequant formula â€?just nibble extraction and zero-extension.
+// Does NOT apply dequant formula ï¿½?just nibble extraction and zero-extension.
 // For use as intermediate input to VNNI matmul that applies dequant post-dot-product.
 void ds4_xeon_unpack_q4_k_to_i16(
     int16_t *i16, const ds4_xeon_block_q4_K *x)
@@ -594,13 +602,13 @@ void ds4_xeon_dequant_q4_k_to_i16(
                 q16 = _mm256_cvtepu8_epi16(_mm_and_si128(
                     _mm_srli_epi16(q8, 4), _mm_set1_epi8(0x0F)));
             }
-            // Convert uint16 â†?float32
+            // Convert uint16 ï¿½?float32
             __m512 qf = _mm512_cvtepu32_ps(_mm512_cvtepu16_epi32(q16));
             // Apply dequant: w = sc * q4 - m
             __m512 wf = _mm512_fmsub_ps(v_sc, qf, v_m);
             // Clamp to int16 range
             wf = _mm512_min_ps(_mm512_max_ps(wf, vm32768), v32767);
-            // Round and pack: float32 â†?int32 â†?int16
+            // Round and pack: float32 ï¿½?int32 ï¿½?int16
             __m512i wi32 = _mm512_cvtps_epi32(
                 _mm512_roundscale_ps(wf, _MM_FROUND_TO_NEAREST_INT));
             __m256i wi16 = _mm512_cvtsepi32_epi16(wi32);
@@ -611,7 +619,7 @@ void ds4_xeon_dequant_q4_k_to_i16(
 
 // ============================================================================
 // Q4_K VNNI Kernels (existing, preserved from original implementation)
-// These use on-the-fly 4-bit dequant â†?VPDPWSSD (INT16 path).
+// These use on-the-fly 4-bit dequant ï¿½?VPDPWSSD (INT16 path).
 // Will be superseded by pre-dequant + VPDPBUSD for gate/up.
 // ============================================================================
 
@@ -700,17 +708,17 @@ void ds4_xeon_vec_dot_q4_K_vnni(int n, float *s, const ds4_xeon_block_q4_K *x,
 }
 
 // ============================================================================
-// IQ2_XXS VNNI â€?AVX-512 vectorized with gather + VPDPWSSD.
+// IQ2_XXS VNNI ï¿½?AVX-512 vectorized with gather + VPDPWSSD.
 //
 // Each IQ2XXS block has 32 qs entries (uint16_t). Each qs entry encodes:
-//   low 8 bits  â†?index into iq2xxs_grid[256] (uint64_t, packs 8Ã— int8)
-//   high 8 bits â†?index into ksigns_iq2xs[128] (uint8_t, 8 sign bits)
+//   low 8 bits  ï¿½?index into iq2xxs_grid[256] (uint64_t, packs 8Ã— int8)
+//   high 8 bits ï¿½?index into ksigns_iq2xs[128] (uint8_t, 8 sign bits)
 //
 // Scalar decode: grid = iq2xxs_grid[lo]; signs = ksigns_iq2xs[hi];
 //   for k in 0..7: v = (int8_t)grid.byte[k]; if signs & (1<<k) v = -v;
 //
-// Vectorized: process 8 qs entries (â†?64 int8 weights) per iteration.
-//   1. Gather 8 grid uint64_t â†?store as 64 raw int8 bytes (no scalar extraction)
+// Vectorized: process 8 qs entries (ï¿½?64 int8 weights) per iteration.
+//   1. Gather 8 grid uint64_t ï¿½?store as 64 raw int8 bytes (no scalar extraction)
 //   2. Build 64-byte negation mask from sign bytes via LUT
 //   3. sub(xor(raw, mask), mask) for conditional two's-complement negation
 //   4. Extend int8â†’int16, VPDPWSSD for dot product
@@ -813,7 +821,7 @@ void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs
             __m128i hi8 = _mm_and_si128(
                 _mm_srli_epi16(qv, 8), _mm_set1_epi16(0x7F));
 
-            // Store gathered grid values â†?64 raw int8 bytes (no scalar extraction)
+            // Store gathered grid values ï¿½?64 raw int8 bytes (no scalar extraction)
             uint64_t gl[8];
             _mm512_storeu_si512((__m512i*)gl, g64);
 
@@ -833,7 +841,7 @@ void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs
             __m512i w8_signed = _mm512_sub_epi8(
                 _mm512_xor_si512(w8_raw, m8), m8);
 
-            // Extend int8 â†?int16 (two halves, 32 each)
+            // Extend int8 ï¿½?int16 (two halves, 32 each)
             __m256i w8_lo = _mm512_castsi512_si256(w8_signed);
             __m256i w8_hi = _mm512_extracti64x4_epi64(w8_signed, 1);
             __m512i w16_lo = _mm512_cvtepi8_epi16(w8_lo);
@@ -997,16 +1005,19 @@ void ds4_xeon_swiglu(float *o, const float *x, const float *y, int n) {
 // ============================================================================
 
 void ds4_xeon_graph_init(ds4_xeon_graph *g, uint32_t max_batch_size,
-    uint32_t n_embd, uint32_t n_ff_exp, uint32_t n_expert,
-    uint32_t n_expert_used, uint32_t n_layer)
+    uint32_t n_embd, uint32_t n_ff_exp, uint32_t n_hc,
+    uint32_t n_expert, uint32_t n_expert_used, uint32_t n_layer,
+    int numa_node)
 {
     memset(g, 0, sizeof(*g));
     g->max_batch_size = max_batch_size;
     g->n_embd = n_embd;
     g->n_ff_exp = n_ff_exp;
+    g->n_hc = n_hc;
     g->n_expert = n_expert;
     g->n_expert_used = n_expert_used;
     g->n_layer = n_layer;
+    g->numa_node = numa_node;
 
     const uint32_t mb = max_batch_size;
     const int block_size = 64;
@@ -1028,6 +1039,7 @@ void ds4_xeon_graph_init(ds4_xeon_graph *g, uint32_t max_batch_size,
     XALLOC(g->f32_gate,     (size_t)mb * n_ff_exp, float);
     XALLOC(g->f32_up,       (size_t)mb * n_ff_exp, float);
     XALLOC(g->f32_mid,      (size_t)mb * n_ff_exp, float);
+    XALLOC(g->f32_hc,       (size_t)mb * n_hc, float);
     XALLOC(g->f32_router_logits, (size_t)mb * n_expert, float);
     XALLOC(g->selected_experts,  (size_t)mb * n_expert_used, int32_t);
     XALLOC(g->expert_weights,    (size_t)mb * n_expert_used, float);
@@ -1045,6 +1057,7 @@ void ds4_xeon_graph_free(ds4_xeon_graph *g) {
     free(g->f32_attn_out); free(g->f32_ffn_cur);
     free(g->f32_norm);   free(g->f32_gate);
     free(g->f32_up);     free(g->f32_mid);
+    free(g->f32_hc);
     free(g->f32_router_logits);
     free(g->selected_experts); free(g->expert_weights);
     free(g->f32_shared_out);   free(g->f32_moe_out);
@@ -1062,12 +1075,119 @@ int ds4_xeon_predequant_init(
 {
     (void)out; (void)weights_ptr;
     (void)n_layer; (void)n_embd; (void)n_ff_exp; (void)n_expert;
-    // Stub â€?will be implemented in Phase 3 when tensor access patterns
+    // Stub ï¿½?will be implemented in Phase 3 when tensor access patterns
     // from ds4.c are fully mapped. For now, existing Q4_K on-the-fly
     // dequant kernels are used.
     fprintf(stderr, "ds4_xeon: pre-dequant not yet implemented, "
             "using on-the-fly dequant\n");
     return 0;
+}
+
+// ============================================================================
+// NUMA-Aware Allocator
+// ============================================================================
+
+void *ds4_xeon_numa_alloc(size_t size, int node) {
+    void *ptr = NULL;
+#ifdef __linux__
+    // Try to allocate on a specific NUMA node
+    // If the system supports move_pages or libnuma, this will work.
+    // Otherwise fall back to standard aligned_alloc.
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d", node);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        // Node exists â€” first try mmap + mbind for explicit NUMA placement
+        ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr != MAP_FAILED) {
+            // mbind with MPOL_BIND â€” requires libnuma or direct syscall
+            // For now, allocation succeeds but may be on wrong node.
+            // Full NUMA binding requires libnuma; this is a best-effort path.
+            #ifdef SYS_mbind
+            unsigned long nmask = 1UL << (unsigned long)node;
+            long rc = syscall(SYS_mbind, ptr, size,
+                /* MPOL_BIND = 2 */ 2, &nmask, 64, /* MPOL_MF_MOVE = 1 */ 1);
+            if (rc != 0) {
+                // mbind failed, fall through to standard allocation
+                munmap(ptr, size);
+                ptr = aligned_alloc(64, size);
+            }
+            #else
+            // No mbind available, just keep the mmap allocation
+            #endif
+            if (ptr) return ptr;
+        }
+    }
+#endif
+    (void)node;
+    ptr = aligned_alloc(64, size);
+    if (!ptr) {
+        fprintf(stderr, "ds4_xeon: OOM allocating %zu bytes\n", size);
+    }
+    return ptr;
+}
+
+// ============================================================================
+// NUMA Expert Weight Replication
+// ============================================================================
+
+int ds4_xeon_expert_replica_init(
+    ds4_xeon_expert_replica *r,
+    const ds4_xeon_predequant_weights *src,
+    int n_nodes)
+{
+    memset(r, 0, sizeof(*r));
+    r->n_nodes = n_nodes;
+
+    if (!src->gate_up || !src->down) {
+        fprintf(stderr, "ds4_xeon: predequant weights not initialized\n");
+        return -1;
+    }
+
+    // Compute sizes: we need to know the buffer layout from src.
+    // Since the exact layout depends on the model, we infer it from the
+    // pre-dequantized buffer pointers. For now, these are placeholder â€”
+    // the actual sizes will be filled when predequant_init is implemented.
+    //
+    // Gate_up: n_expert * 2 * n_embd * n_ff_exp (gate and up are same dims)
+    // Down:     n_expert * n_embd * n_ff_exp
+    //
+    // These are computed from ds4.c weight layout â€” stubbed for now.
+    r->gate_up_bytes = 0;  // Will be set when predequant_init is implemented
+    r->down_bytes    = 0;
+
+    (void)src;
+    // Once sizes are known, allocate per-node replicas:
+    r->gate_up = calloc((size_t)n_nodes, sizeof(uint8_t*));
+    r->down    = calloc((size_t)n_nodes, sizeof(int16_t*));
+
+    if (!r->gate_up || !r->down) {
+        free(r->gate_up); free(r->down);
+        memset(r, 0, sizeof(*r));
+        return -1;
+    }
+
+    for (int n = 0; n < n_nodes; n++) {
+        // Stub: allocate on node n
+        // r->gate_up[n] = (uint8_t*)ds4_xeon_numa_alloc(r->gate_up_bytes, n);
+        // r->down[n]    = (int16_t*)ds4_xeon_numa_alloc(r->down_bytes, n);
+        r->gate_up[n] = NULL;
+        r->down[n]    = NULL;
+    }
+
+    return 0;
+}
+
+void ds4_xeon_expert_replica_free(ds4_xeon_expert_replica *r) {
+    if (!r) return;
+    for (int n = 0; n < r->n_nodes; n++) {
+        free(r->gate_up[n]);
+        free(r->down[n]);
+    }
+    free(r->gate_up);
+    free(r->down);
+    memset(r, 0, sizeof(*r));
 }
 
 void ds4_xeon_predequant_weights_free(ds4_xeon_predequant_weights *w) {
@@ -1081,14 +1201,150 @@ void ds4_xeon_predequant_weights_free(ds4_xeon_predequant_weights *w) {
 // Thread / NUMA Initialization
 // ============================================================================
 
-void ds4_xeon_threads_init(void) {
+// Detect NUMA topology. Returns number of NUMA nodes (0 if unavailable).
+// On Linux, uses libnuma; on other platforms, returns 0.
+int ds4_xeon_numa_init(void) {
+#ifdef __linux__
+    // Try to read NUMA nodes from sysfs (no libnuma dependency)
+    FILE *f = fopen("/sys/devices/system/node/online", "r");
+    if (!f) return 0;
+
+    int max_node = -1;
+    if (fscanf(f, "0-%d", &max_node) == 1) {
+        fclose(f);
+        fprintf(stderr, "ds4: NUMA available, %d nodes detected\n", max_node + 1);
+        return max_node + 1;
+    }
+    // Try simple count
+    fclose(f);
+    int count = 0;
+    for (int i = 0; i < 64; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d", i);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) count++;
+        else break;
+    }
+    if (count > 0) {
+        fprintf(stderr, "ds4: NUMA available, %d nodes detected\n", count);
+        return count;
+    }
+#endif
+    fprintf(stderr, "ds4: NUMA not available (single-socket or non-Linux)\n");
+    return 0;
+}
+
+// Get CPU mask for a given NUMA node from sysfs.
+// Returns number of CPUs found, writes to cpu_set if provided.
+// Caller must free *cpu_set with CPU_FREE.
+static int numa_node_to_cpuset(int node, cpu_set_t **cpu_set) {
+#ifdef __linux__
+    char path[256];
+    snprintf(path, sizeof(path),
+        "/sys/devices/system/node/node%d/cpulist", node);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char buf[4096] = {0};
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
+    fclose(f);
+
+    // Parse cpulist (e.g. "0,2,4,6" or "0-5" or "0-23,48-71")
+    cpu_set_t *set = CPU_ALLOC(CPU_SETSIZE);
+    if (!set) return 0;
+    CPU_ZERO_S(CPU_ALLOC_SIZE(CPU_SETSIZE), set);
+
+    char *tok = strtok(buf, ",");
+    while (tok) {
+        char *dash = strchr(tok, '-');
+        if (dash) {
+            *dash = '\0';
+            int lo = atoi(tok);
+            int hi = atoi(dash + 1);
+            for (int c = lo; c <= hi; c++)
+                CPU_SET_S(c, CPU_ALLOC_SIZE(CPU_SETSIZE), set);
+        } else {
+            CPU_SET_S(atoi(tok), CPU_ALLOC_SIZE(CPU_SETSIZE), set);
+        }
+        tok = strtok(NULL, ",");
+    }
+
+    *cpu_set = set;
+    return CPU_COUNT_S(CPU_ALLOC_SIZE(CPU_SETSIZE), set);
+#else
+    (void)node;
+    (void)cpu_set;
+    return 0;
+#endif
+}
+
+// Bind OpenMP threads to the CPUs of the specified NUMA node.
+void ds4_xeon_threads_bind(int numa_node) {
+#ifdef __linux__
+    cpu_set_t *cpuset = NULL;
+    int ncpu = numa_node_to_cpuset(numa_node, &cpuset);
+    if (ncpu <= 0 || !cpuset) {
+        fprintf(stderr, "ds4: warning - cannot get CPU set for node %d, "
+                "threads unbound\n", numa_node);
+        return;
+    }
+
+    // Set thread affinity within OpenMP parallel region
     #pragma omp parallel
     {
+        int tid = omp_get_thread_num();
+        int nth = omp_get_num_threads();
+
+        // Striped assignment: thread tid gets the (tid % ncpu)-th CPU in the node
+        int cpu_idx = 0;
+        int assigned_cpu = -1;
+        for (int c = 0; c < CPU_SETSIZE; c++) {
+            if (CPU_ISSET_S(c, CPU_ALLOC_SIZE(CPU_SETSIZE), cpuset)) {
+                if (cpu_idx == (tid % ncpu)) {
+                    assigned_cpu = c;
+                    break;
+                }
+                cpu_idx++;
+            }
+        }
+
+        if (assigned_cpu >= 0) {
+            cpu_set_t *thread_set = CPU_ALLOC(CPU_SETSIZE);
+            CPU_ZERO_S(CPU_ALLOC_SIZE(CPU_SETSIZE), thread_set);
+            CPU_SET_S(assigned_cpu, CPU_ALLOC_SIZE(CPU_SETSIZE), thread_set);
+            int ret = pthread_setaffinity_np(pthread_self(),
+                CPU_ALLOC_SIZE(CPU_SETSIZE), thread_set);
+            CPU_FREE(thread_set);
+            (void)ret;
+        }
+
         #pragma omp master
         {
-            int nth = omp_get_num_threads();
-            fprintf(stderr, "ds4: Xeon backend initialized "
-                    "(AVX-512 VNNI, %d threads)\n", nth);
+            fprintf(stderr, "ds4: bound %d threads to NUMA node %d "
+                    "(%d CPUs)\n", nth, numa_node, ncpu);
+        }
+    }
+
+    CPU_FREE(cpuset);
+#else
+    (void)numa_node;
+    fprintf(stderr, "ds4: thread binding not available on this platform\n");
+#endif
+}
+
+void ds4_xeon_threads_init(void) {
+    int nn = ds4_xeon_numa_init();
+    if (nn > 0) {
+        ds4_xeon_threads_bind(0);
+    } else {
+        #pragma omp parallel
+        {
+            #pragma omp master
+            {
+                int nth = omp_get_num_threads();
+                fprintf(stderr, "ds4: Xeon backend initialized "
+                        "(AVX-512 VNNI, %d threads)\n", nth);
+            }
         }
     }
 }
