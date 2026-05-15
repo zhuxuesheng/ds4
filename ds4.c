@@ -15549,84 +15549,70 @@ struct ds4_session {
  * down:    [n_expert][n_ff_exp][n_embd] int16
  * Uses AVX-512 vectorized block dequant (ds4_xeon_dequant_iq2xxs_block_to_u8).
  * Called lazily when entering a new layer in the prefill/decode loop. */
-static void ds4_xeon_predequant_layer(
+// Dequantize a single expert's gate + up weights on demand.
+// Called from T7.2 batch GEMM when an expert is first encountered
+// and its weights are not yet cached.
+static void ds4_xeon_predequant_expert(
         ds4_xeon_predequant_weights *w,
         const ds4_model *model,
         const ds4_layer_weights *layer,
-        int layer_idx)
+        int eid)
 {
     int buf = w->current_buf;
-    if (w->cached_layer[buf] == layer_idx) return;  // already cached
-    w->cached_layer[buf] = layer_idx;
-    uint8_t *gate_up_dst = w->gate_up[buf];
-    int16_t *down_dst    = w->down[buf];
     const uint32_t n_embd  = w->n_embd;
     const uint32_t n_ff    = w->n_ff_exp;
-    const uint32_t n_expert = w->n_expert;
 
-    // Gate experts (IQ2XXS → uint8)
+    // Gate (IQ2XXS → uint8)
     if (layer->ffn_gate_exps && layer->ffn_gate_exps->ndim == 3) {
         uint64_t in_dim, out_dim, row_bytes;
+        const uint8_t *src = tensor_expert_bytes(model,
+            layer->ffn_gate_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
         const gguf_type_info *info = tensor_type(layer->ffn_gate_exps->type);
-        for (uint32_t e = 0; e < n_expert; e++) {
-            const uint8_t *src = tensor_expert_bytes(model,
-                layer->ffn_gate_exps, e, &in_dim, &out_dim, &row_bytes);
-            if (!info || info->block_elems == 0) continue;
+        if (info && info->block_elems > 0) {
             uint64_t n_blocks = ((in_dim + info->block_elems - 1)
                 / info->block_elems) * out_dim;
-            uint8_t *dst = gate_up_dst
-                + ((uint64_t)e * 2 + 0) * (uint64_t)n_embd * n_ff;
-            for (uint64_t b = 0; b < n_blocks; b++) {
-                const ds4_xeon_block_iq2_xxs *block =
-                    (const ds4_xeon_block_iq2_xxs*)(
-                        src + b * info->block_bytes);
+            uint8_t *dst = w->gate_up[buf]
+                + ((uint64_t)eid * 2 + 0) * (uint64_t)n_embd * n_ff;
+            for (uint64_t b = 0; b < n_blocks; b++)
                 ds4_xeon_dequant_iq2xxs_block_to_u8(
-                    dst + b * DS4_XEON_QK_K, block);
-            }
+                    dst + b * DS4_XEON_QK_K,
+                    (const ds4_xeon_block_iq2_xxs*)(src + b * info->block_bytes));
         }
     }
 
-    // Up experts (IQ2XXS → uint8, same dims as gate)
+    // Up (IQ2XXS → uint8)
     if (layer->ffn_up_exps && layer->ffn_up_exps->ndim == 3) {
-        uint64_t in_dim_u, out_dim_u, row_bytes_u;
-        const gguf_type_info *info_u = tensor_type(layer->ffn_up_exps->type);
-        for (uint32_t e = 0; e < n_expert; e++) {
-            const uint8_t *src = tensor_expert_bytes(model,
-                layer->ffn_up_exps, e, &in_dim_u, &out_dim_u, &row_bytes_u);
-            if (!info_u || info_u->block_elems == 0) continue;
-            uint64_t n_blocks = ((in_dim_u + info_u->block_elems - 1)
-                / info_u->block_elems) * out_dim_u;
-            uint8_t *dst = gate_up_dst
-                + ((uint64_t)e * 2 + 1) * (uint64_t)n_embd * n_ff;
-            for (uint64_t b = 0; b < n_blocks; b++) {
-                const ds4_xeon_block_iq2_xxs *block =
-                    (const ds4_xeon_block_iq2_xxs*)(
-                        src + b * info_u->block_bytes);
+        uint64_t in_dim, out_dim, row_bytes;
+        const uint8_t *src = tensor_expert_bytes(model,
+            layer->ffn_up_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
+        const gguf_type_info *info = tensor_type(layer->ffn_up_exps->type);
+        if (info && info->block_elems > 0) {
+            uint64_t n_blocks = ((in_dim + info->block_elems - 1)
+                / info->block_elems) * out_dim;
+            uint8_t *dst = w->gate_up[buf]
+                + ((uint64_t)eid * 2 + 1) * (uint64_t)n_embd * n_ff;
+            for (uint64_t b = 0; b < n_blocks; b++)
                 ds4_xeon_dequant_iq2xxs_block_to_u8(
-                    dst + b * DS4_XEON_QK_K, block);
-            }
+                    dst + b * DS4_XEON_QK_K,
+                    (const ds4_xeon_block_iq2_xxs*)(src + b * info->block_bytes));
         }
     }
 
-    // Down experts (Q2_K → int16)
+    // Down (Q2_K → int16)
     if (layer->ffn_down_exps && layer->ffn_down_exps->ndim == 3) {
         uint64_t in_dim, out_dim, row_bytes;
+        const uint8_t *src = tensor_expert_bytes(model,
+            layer->ffn_down_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
         const gguf_type_info *info = tensor_type(layer->ffn_down_exps->type);
-        for (uint32_t e = 0; e < n_expert; e++) {
-            const uint8_t *src = tensor_expert_bytes(model,
-                layer->ffn_down_exps, e, &in_dim, &out_dim, &row_bytes);
-            if (!info || info->block_elems == 0) continue;
+        if (info && info->block_elems > 0) {
             uint64_t n_blocks = ((in_dim + info->block_elems - 1)
                 / info->block_elems) * out_dim;
-            int16_t *dst = down_dst
-                + (uint64_t)e * in_dim * out_dim;
-            for (uint64_t b = 0; b < n_blocks; b++) {
-                const ds4_xeon_block_q2_K *block =
-                    (const ds4_xeon_block_q2_K*)(
-                        src + b * info->block_bytes);
+            int16_t *dst = w->down[buf]
+                + (uint64_t)eid * in_dim * out_dim;
+            for (uint64_t b = 0; b < n_blocks; b++)
                 ds4_xeon_dequant_q2k_block_to_i16(
-                    dst + b * DS4_XEON_QK_K, block);
-            }
+                    dst + b * DS4_XEON_QK_K,
+                    (const ds4_xeon_block_q2_K*)(src + b * info->block_bytes));
         }
     }
 }
@@ -15706,8 +15692,9 @@ static void ds4_xeon_ffn_shared_batch(
         }
     }
 
-    // --- T7.2: Per-expert batch GEMM with pre-dequant weights ---
+    // --- T7.2: Per-expert batch GEMM (on-demand dequant) ---
     ds4_xeon_predequant_weights *pw = &s->predequant;
+    bool expert_ready[DS4_N_EXPERT] = {0};
     int buf = pw->current_buf;
     const int block_size = 64;
     const int a8_n_blocks = (int)DS4_N_EMBD / block_size;
@@ -15715,6 +15702,12 @@ static void ds4_xeon_ffn_shared_batch(
     for (int eid = 0; eid < DS4_N_EXPERT; eid++) {
         int ne = h_cnt[eid];
         if (ne == 0) continue;
+
+        // On-demand dequant: first use of this expert in this layer
+        if (!expert_ready[eid]) {
+            ds4_xeon_predequant_expert(pw, model, lw, eid);
+            expert_ready[eid] = true;
+        }
 
         float *act_f32 = xmalloc((size_t)ne * DS4_N_EMBD * sizeof(float));
         for (int i = 0; i < ne; i++) {
@@ -15837,9 +15830,6 @@ static void prefill_xeon_graph(
         fflush(stderr);
 
         const ds4_layer_weights *lw = &e->weights.layer[il];
-
-        // 0. Pre-dequantize this layer's expert weights (cached, once per layer)
-        ds4_xeon_predequant_layer(&s->predequant, &e->model, lw, (int)il);
 
         // 1. Attention (FP32)
         layer_attention_raw_swa_batch(next_f32,
