@@ -39,7 +39,7 @@ static inline float xeon_f16_to_f32(uint16_t h) {
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
 
 // ============================================================================
-// VPDPBUSD: INT8 VNNI matmul (activation int8 Ã— weight uint8 â†’ float)
+// VPDPBUSD: INT8 VNNI matmul (activation int8 Ã— weight uint8 â†?float)
 // Primary kernel for gate/up/attention projections (~70% of MACs).
 //
 // Activations are per-block scaled (Q8_0 style, block_size=32).
@@ -58,7 +58,7 @@ void ds4_xeon_matmul_a8w8_vnni(
     const int n_blocks = in_dim / block_size;
 
     // Average activation scale (per-block scales require block-wise dequant,
-    // but for now use average â€” within 1% for RMS-Norm-bounded activations)
+    // but for now use average â€?within 1% for RMS-Norm-bounded activations)
     float a_s = 1.0f;
     if (a8_scale) {
         a_s = 0.0f;
@@ -230,7 +230,7 @@ void ds4_xeon_matmul_a8w8_vnni_batch(
 }
 
 // ============================================================================
-// VPDPWSSD: INT16 VNNI matmul (activation int16 Ã— weight int16 â†’ float)
+// VPDPWSSD: INT16 VNNI matmul (activation int16 Ã— weight int16 â†?float)
 // Fallback kernel for FFN down projection only (~30% of MACs).
 //
 // Activations are per-token scaled (one float scale per token vector).
@@ -425,7 +425,7 @@ void ds4_xeon_quantize_a8_per_block(int8_t *out, float *scale,
             float id = 1.0f / d;
             scale_row[b] = d;
 
-            // Quantize: F32 â†’ int8 via round + saturating pack
+            // Quantize: F32 â†?int8 via round + saturating pack
             __m512 vid = _mm512_set1_ps(id);
             for (int c = 0; c < n16; c++) {
                 __m512 v = _mm512_loadu_ps(bin + c * 16);
@@ -477,7 +477,7 @@ void ds4_xeon_quantize_a16_per_token(int16_t *out, float *scale,
         float inv_s = 1.0f / s;
         scale[t] = s;
 
-        // Quantize: F32 â†’ int16 (16 elements per iteration = 256 bits)
+        // Quantize: F32 â†?int16 (16 elements per iteration = 256 bits)
         __m512 vid = _mm512_set1_ps(inv_s);
         __m512 vmax_i16 = _mm512_set1_ps(32767.0f);
         __m512 vmin_i16 = _mm512_set1_ps(-32768.0f);
@@ -501,8 +501,117 @@ void ds4_xeon_quantize_a16_per_token(int16_t *out, float *scale,
 }
 
 // ============================================================================
+// Q4_K Weight Unpack / Dequant
+// ============================================================================
+
+// Forward declaration (defined in existing Q4_K kernels section below)
+static inline void ds4q_get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m);
+
+// Extract 256 nibbles from a Q4_K block to uint8_t.
+// The block's 128 packed bytes (qs[128]) hold 256 4-bit nibbles in 8 sub-blocks
+// of 32 elements each. Sub-blocks paired by nibble position: even j uses low
+// nibble, odd j uses high nibble, each pair shares 32 packed bytes.
+void ds4_xeon_unpack_q4_k_to_u8(
+    uint8_t *u8, float *sc8, float *m8,
+    const ds4_xeon_block_q4_K *x)
+{
+    const float d   = xeon_f16_to_f32(x->d);
+    const float dmin = xeon_f16_to_f32(x->dmin);
+
+    for (int j = 0; j < 8; j++) {
+        uint8_t sc_val, m_val;
+        ds4q_get_scale_min_k4(j, x->scales, &sc_val, &m_val);
+
+        sc8[j] = d * (float)sc_val;
+        m8[j]  = dmin * (float)m_val;
+
+        const uint8_t *q_ptr = x->qs + (j / 2) * 32;
+        uint8_t *out = u8 + j * 32;
+
+        if (j % 2 == 0) {
+            // Low nibbles
+            for (int k = 0; k < 32; k++)
+                out[k] = q_ptr[k] & 0x0F;
+        } else {
+            // High nibbles
+            for (int k = 0; k < 32; k++)
+                out[k] = q_ptr[k] >> 4;
+        }
+    }
+}
+
+// Extract 256 nibbles from a Q4_K block to int16_t (raw values 0-15).
+// Does NOT apply dequant formula â€?just nibble extraction and zero-extension.
+// For use as intermediate input to VNNI matmul that applies dequant post-dot-product.
+void ds4_xeon_unpack_q4_k_to_i16(
+    int16_t *i16, const ds4_xeon_block_q4_K *x)
+{
+    for (int j = 0; j < 8; j++) {
+        const uint8_t *q_ptr = x->qs + (j / 2) * 32;
+        int16_t *out = i16 + j * 32;
+
+        if (j % 2 == 0) {
+            for (int k = 0; k < 32; k++)
+                out[k] = (int16_t)(q_ptr[k] & 0x0F);
+        } else {
+            for (int k = 0; k < 32; k++)
+                out[k] = (int16_t)(q_ptr[k] >> 4);
+        }
+    }
+}
+
+// Fully dequantize a Q4_K block to int16_t[256].
+// w16[k] = round(d * sc * q4 - dmin * m), clamped to [-32768, 32767].
+// Uses AVX-512 for nibble extraction and arithmetic.
+void ds4_xeon_dequant_q4_k_to_i16(
+    int16_t *i16, const ds4_xeon_block_q4_K *x)
+{
+    const float d   = xeon_f16_to_f32(x->d);
+    const float dmin = xeon_f16_to_f32(x->dmin);
+    const __m512 v32767 = _mm512_set1_ps(32767.0f);
+    const __m512 vm32768 = _mm512_set1_ps(-32768.0f);
+
+    for (int j = 0; j < 8; j++) {
+        uint8_t sc_val, m_val;
+        ds4q_get_scale_min_k4(j, x->scales, &sc_val, &m_val);
+
+        const float f_sc = d * (float)sc_val;
+        const float f_m = dmin * (float)m_val;
+        const __m512 v_sc = _mm512_set1_ps(f_sc);
+        const __m512 v_m = _mm512_set1_ps(f_m);
+
+        const uint8_t *q_ptr = x->qs + (j / 2) * 32;
+        int16_t *out = i16 + j * 32;
+
+        // Process 32 elements in 2 iterations of 16 (one ZMM = 16 floats)
+        for (int k = 0; k < 32; k += 16) {
+            // Load 16 packed bytes, extract nibbles to 16 uint32
+            __m128i q8 = _mm_loadu_si128((const __m128i*)(q_ptr + k));
+            __m256i q16;
+            if (j % 2 == 0) {
+                q16 = _mm256_cvtepu8_epi16(_mm_and_si128(q8, _mm_set1_epi8(0x0F)));
+            } else {
+                q16 = _mm256_cvtepu8_epi16(_mm_and_si128(
+                    _mm_srli_epi16(q8, 4), _mm_set1_epi8(0x0F)));
+            }
+            // Convert uint16 â†?float32
+            __m512 qf = _mm512_cvtepu32_ps(_mm512_cvtepu16_epi32(q16));
+            // Apply dequant: w = sc * q4 - m
+            __m512 wf = _mm512_fmsub_ps(v_sc, qf, v_m);
+            // Clamp to int16 range
+            wf = _mm512_min_ps(_mm512_max_ps(wf, vm32768), v32767);
+            // Round and pack: float32 â†?int32 â†?int16
+            __m512i wi32 = _mm512_cvtps_epi32(
+                _mm512_roundscale_ps(wf, _MM_FROUND_TO_NEAREST_INT));
+            __m256i wi16 = _mm512_cvtsepi32_epi16(wi32);
+            _mm256_storeu_si256((__m256i*)(out + k), wi16);
+        }
+    }
+}
+
+// ============================================================================
 // Q4_K VNNI Kernels (existing, preserved from original implementation)
-// These use on-the-fly 4-bit dequant â†’ VPDPWSSD (INT16 path).
+// These use on-the-fly 4-bit dequant â†?VPDPWSSD (INT16 path).
 // Will be superseded by pre-dequant + VPDPBUSD for gate/up.
 // ============================================================================
 
@@ -591,32 +700,160 @@ void ds4_xeon_vec_dot_q4_K_vnni(int n, float *s, const ds4_xeon_block_q4_K *x,
 }
 
 // ============================================================================
-// IQ2_XXS VNNI (scalar inner loop â€” needs vectorization per Phase 3 / Step 6)
+// IQ2_XXS VNNI â€?AVX-512 vectorized with gather + VPDPWSSD.
+//
+// Each IQ2XXS block has 32 qs entries (uint16_t). Each qs entry encodes:
+//   low 8 bits  â†?index into iq2xxs_grid[256] (uint64_t, packs 8Ã— int8)
+//   high 8 bits â†?index into ksigns_iq2xs[128] (uint8_t, 8 sign bits)
+//
+// Scalar decode: grid = iq2xxs_grid[lo]; signs = ksigns_iq2xs[hi];
+//   for k in 0..7: v = (int8_t)grid.byte[k]; if signs & (1<<k) v = -v;
+//
+// Vectorized: process 8 qs entries (â†?64 int8 weights) per iteration.
+//   1. Gather 8 grid uint64_t â†?store as 64 raw int8 bytes (no scalar extraction)
+//   2. Build 64-byte negation mask from sign bytes via LUT
+//   3. sub(xor(raw, mask), mask) for conditional two's-complement negation
+//   4. Extend int8â†’int16, VPDPWSSD for dot product
 // ============================================================================
+
+// LUT: expand a sign byte (8 bits) to 8 mask bytes (0xFF where bit is set)
+// sign_mask_lut[b][k] = (b & (1<<k)) ? 0xFF : 0x00
+static const uint64_t iq2xxs_sign_mask_lut[256] = {
+    0x0000000000000000ULL, 0x00000000000000FFULL, 0x000000000000FF00ULL, 0x000000000000FFFFULL,
+    0x0000000000FF0000ULL, 0x0000000000FF00FFULL, 0x0000000000FFFF00ULL, 0x0000000000FFFFFFULL,
+    0x00000000FF000000ULL, 0x00000000FF0000FFULL, 0x00000000FF00FF00ULL, 0x00000000FF00FFFFULL,
+    0x00000000FFFF0000ULL, 0x00000000FFFF00FFULL, 0x00000000FFFFFF00ULL, 0x00000000FFFFFFFFULL,
+    0x000000FF00000000ULL, 0x000000FF000000FFULL, 0x000000FF0000FF00ULL, 0x000000FF0000FFFFULL,
+    0x000000FF00FF0000ULL, 0x000000FF00FF00FFULL, 0x000000FF00FFFF00ULL, 0x000000FF00FFFFFFULL,
+    0x000000FFFF000000ULL, 0x000000FFFF0000FFULL, 0x000000FFFF00FF00ULL, 0x000000FFFF00FFFFULL,
+    0x000000FFFFFF0000ULL, 0x000000FFFFFF00FFULL, 0x000000FFFFFFFF00ULL, 0x000000FFFFFFFFFFULL,
+    0x0000FF0000000000ULL, 0x0000FF00000000FFULL, 0x0000FF000000FF00ULL, 0x0000FF000000FFFFULL,
+    0x0000FF0000FF0000ULL, 0x0000FF0000FF00FFULL, 0x0000FF0000FFFF00ULL, 0x0000FF0000FFFFFFULL,
+    0x0000FF00FF000000ULL, 0x0000FF00FF0000FFULL, 0x0000FF00FF00FF00ULL, 0x0000FF00FF00FFFFULL,
+    0x0000FF00FFFF0000ULL, 0x0000FF00FFFF00FFULL, 0x0000FF00FFFFFF00ULL, 0x0000FF00FFFFFFFFULL,
+    0x0000FFFF00000000ULL, 0x0000FFFF000000FFULL, 0x0000FFFF0000FF00ULL, 0x0000FFFF0000FFFFULL,
+    0x0000FFFF00FF0000ULL, 0x0000FFFF00FF00FFULL, 0x0000FFFF00FFFF00ULL, 0x0000FFFF00FFFFFFULL,
+    0x0000FFFFFF000000ULL, 0x0000FFFFFF0000FFULL, 0x0000FFFFFF00FF00ULL, 0x0000FFFFFF00FFFFULL,
+    0x0000FFFFFFFF0000ULL, 0x0000FFFFFFFF00FFULL, 0x0000FFFFFFFFFF00ULL, 0x0000FFFFFFFFFFFFULL,
+    0x00FF000000000000ULL, 0x00FF0000000000FFULL, 0x00FF00000000FF00ULL, 0x00FF00000000FFFFULL,
+    0x00FF000000FF0000ULL, 0x00FF000000FF00FFULL, 0x00FF000000FFFF00ULL, 0x00FF000000FFFFFFULL,
+    0x00FF0000FF000000ULL, 0x00FF0000FF0000FFULL, 0x00FF0000FF00FF00ULL, 0x00FF0000FF00FFFFULL,
+    0x00FF0000FFFF0000ULL, 0x00FF0000FFFF00FFULL, 0x00FF0000FFFFFF00ULL, 0x00FF0000FFFFFFFFULL,
+    0x00FF00FF00000000ULL, 0x00FF00FF000000FFULL, 0x00FF00FF0000FF00ULL, 0x00FF00FF0000FFFFULL,
+    0x00FF00FF00FF0000ULL, 0x00FF00FF00FF00FFULL, 0x00FF00FF00FFFF00ULL, 0x00FF00FF00FFFFFFULL,
+    0x00FF00FFFF000000ULL, 0x00FF00FFFF0000FFULL, 0x00FF00FFFF00FF00ULL, 0x00FF00FFFF00FFFFULL,
+    0x00FF00FFFFFF0000ULL, 0x00FF00FFFFFF00FFULL, 0x00FF00FFFFFFFF00ULL, 0x00FF00FFFFFFFFFFULL,
+    0x00FFFF0000000000ULL, 0x00FFFF00000000FFULL, 0x00FFFF000000FF00ULL, 0x00FFFF000000FFFFULL,
+    0x00FFFF0000FF0000ULL, 0x00FFFF0000FF00FFULL, 0x00FFFF0000FFFF00ULL, 0x00FFFF0000FFFFFFULL,
+    0x00FFFF00FF000000ULL, 0x00FFFF00FF0000FFULL, 0x00FFFF00FF00FF00ULL, 0x00FFFF00FF00FFFFULL,
+    0x00FFFF00FFFF0000ULL, 0x00FFFF00FFFF00FFULL, 0x00FFFF00FFFFFF00ULL, 0x00FFFF00FFFFFFFFULL,
+    0x00FFFFFF00000000ULL, 0x00FFFFFF000000FFULL, 0x00FFFFFF0000FF00ULL, 0x00FFFFFF0000FFFFULL,
+    0x00FFFFFF00FF0000ULL, 0x00FFFFFF00FF00FFULL, 0x00FFFFFF00FFFF00ULL, 0x00FFFFFF00FFFFFFULL,
+    0x00FFFFFFFF000000ULL, 0x00FFFFFFFF0000FFULL, 0x00FFFFFFFF00FF00ULL, 0x00FFFFFFFF00FFFFULL,
+    0x00FFFFFFFFFF0000ULL, 0x00FFFFFFFFFF00FFULL, 0x00FFFFFFFFFFFF00ULL, 0x00FFFFFFFFFFFFFFULL,
+    0xFF00000000000000ULL, 0xFF000000000000FFULL, 0xFF0000000000FF00ULL, 0xFF0000000000FFFFULL,
+    0xFF00000000FF0000ULL, 0xFF00000000FF00FFULL, 0xFF00000000FFFF00ULL, 0xFF00000000FFFFFFULL,
+    0xFF000000FF000000ULL, 0xFF000000FF0000FFULL, 0xFF000000FF00FF00ULL, 0xFF000000FF00FFFFULL,
+    0xFF000000FFFF0000ULL, 0xFF000000FFFF00FFULL, 0xFF000000FFFFFF00ULL, 0xFF000000FFFFFFFFULL,
+    0xFF0000FF00000000ULL, 0xFF0000FF000000FFULL, 0xFF0000FF0000FF00ULL, 0xFF0000FF0000FFFFULL,
+    0xFF0000FF00FF0000ULL, 0xFF0000FF00FF00FFULL, 0xFF0000FF00FFFF00ULL, 0xFF0000FF00FFFFFFULL,
+    0xFF0000FFFF000000ULL, 0xFF0000FFFF0000FFULL, 0xFF0000FFFF00FF00ULL, 0xFF0000FFFF00FFFFULL,
+    0xFF0000FFFFFF0000ULL, 0xFF0000FFFFFF00FFULL, 0xFF0000FFFFFFFF00ULL, 0xFF0000FFFFFFFFFFULL,
+    0xFF00FF0000000000ULL, 0xFF00FF00000000FFULL, 0xFF00FF000000FF00ULL, 0xFF00FF000000FFFFULL,
+    0xFF00FF0000FF0000ULL, 0xFF00FF0000FF00FFULL, 0xFF00FF0000FFFF00ULL, 0xFF00FF0000FFFFFFULL,
+    0xFF00FF00FF000000ULL, 0xFF00FF00FF0000FFULL, 0xFF00FF00FF00FF00ULL, 0xFF00FF00FF00FFFFULL,
+    0xFF00FF00FFFF0000ULL, 0xFF00FF00FFFF00FFULL, 0xFF00FF00FFFFFF00ULL, 0xFF00FF00FFFFFFFFULL,
+    0xFF00FFFF00000000ULL, 0xFF00FFFF000000FFULL, 0xFF00FFFF0000FF00ULL, 0xFF00FFFF0000FFFFULL,
+    0xFF00FFFF00FF0000ULL, 0xFF00FFFF00FF00FFULL, 0xFF00FFFF00FFFF00ULL, 0xFF00FFFF00FFFFFFULL,
+    0xFF00FFFFFF000000ULL, 0xFF00FFFFFF0000FFULL, 0xFF00FFFFFF00FF00ULL, 0xFF00FFFFFF00FFFFULL,
+    0xFF00FFFFFFFF0000ULL, 0xFF00FFFFFFFF00FFULL, 0xFF00FFFFFFFFFF00ULL, 0xFF00FFFFFFFFFFFFULL,
+    0xFFFF000000000000ULL, 0xFFFF0000000000FFULL, 0xFFFF00000000FF00ULL, 0xFFFF00000000FFFFULL,
+    0xFFFF000000FF0000ULL, 0xFFFF000000FF00FFULL, 0xFFFF000000FFFF00ULL, 0xFFFF000000FFFFFFULL,
+    0xFFFF0000FF000000ULL, 0xFFFF0000FF0000FFULL, 0xFFFF0000FF00FF00ULL, 0xFFFF0000FF00FFFFULL,
+    0xFFFF0000FFFF0000ULL, 0xFFFF0000FFFF00FFULL, 0xFFFF0000FFFFFF00ULL, 0xFFFF0000FFFFFFFFULL,
+    0xFFFF00FF00000000ULL, 0xFFFF00FF000000FFULL, 0xFFFF00FF0000FF00ULL, 0xFFFF00FF0000FFFFULL,
+    0xFFFF00FF00FF0000ULL, 0xFFFF00FF00FF00FFULL, 0xFFFF00FF00FFFF00ULL, 0xFFFF00FF00FFFFFFULL,
+    0xFFFF00FFFF000000ULL, 0xFFFF00FFFF0000FFULL, 0xFFFF00FFFF00FF00ULL, 0xFFFF00FFFF00FFFFULL,
+    0xFFFF00FFFFFF0000ULL, 0xFFFF00FFFFFF00FFULL, 0xFFFF00FFFFFFFF00ULL, 0xFFFF00FFFFFFFFFFULL,
+    0xFFFFFF0000000000ULL, 0xFFFFFF00000000FFULL, 0xFFFFFF000000FF00ULL, 0xFFFFFF000000FFFFULL,
+    0xFFFFFF0000FF0000ULL, 0xFFFFFF0000FF00FFULL, 0xFFFFFF0000FFFF00ULL, 0xFFFFFF0000FFFFFFULL,
+    0xFFFFFF00FF000000ULL, 0xFFFFFF00FF0000FFULL, 0xFFFFFF00FF00FF00ULL, 0xFFFFFF00FF00FFFFULL,
+    0xFFFFFF00FFFF0000ULL, 0xFFFFFF00FFFF00FFULL, 0xFFFFFF00FFFFFF00ULL, 0xFFFFFF00FFFFFFFFULL,
+    0xFFFFFFFF00000000ULL, 0xFFFFFFFF000000FFULL, 0xFFFFFFFF0000FF00ULL, 0xFFFFFFFF0000FFFFULL,
+    0xFFFFFFFF00FF0000ULL, 0xFFFFFFFF00FF00FFULL, 0xFFFFFFFF00FFFF00ULL, 0xFFFFFFFF00FFFFFFULL,
+    0xFFFFFFFFFF000000ULL, 0xFFFFFFFFFF0000FFULL, 0xFFFFFFFFFF00FF00ULL, 0xFFFFFFFFFF00FFFFULL,
+    0xFFFFFFFFFFFF0000ULL, 0xFFFFFFFFFFFF00FFULL, 0xFFFFFFFFFFFFFF00ULL, 0xFFFFFFFFFFFFFFFFULL,
+};
 
 void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs *x,
     const int16_t *y_i16, float scale_y)
 {
     const int nb = n / DS4_XEON_QK_K;
     float sumf = 0.0f;
+
     for (int i = 0; i < nb; i++) {
         const float d = xeon_f16_to_f32(x[i].d) * scale_y;
         const uint16_t *qs = x[i].qs;
         const int16_t *a16 = y_i16 + (uint64_t)i * DS4_XEON_QK_K;
-        for (int j = 0; j < 32; j++) {
-            uint16_t q = qs[j];
-            uint64_t grid = iq2xxs_grid[q & 255];
-            uint8_t signs = ksigns_iq2xs[q >> 8];
 
-            int32_t dot = 0;
-            for (int k = 0; k < 8; k++) {
-                int8_t v = (int8_t)((grid >> (k * 8)) & 0xFF);
-                if (signs & (1 << k)) v = -v;
-                dot += (int32_t)v * (int32_t)a16[j * 8 + k];
+        int32_t acc = 0;
+
+        // Process 8 qs entries per iteration (64 weights Ã— 64 activations)
+        for (int j = 0; j < 32; j += 8) {
+            // Load 8 uint16 qs values
+            __m128i qv = _mm_loadu_si128((const __m128i*)(qs + j));
+
+            // Grid indices from low bytes
+            __m256i lo32 = _mm256_cvtepu16_epi32(
+                _mm_and_si128(qv, _mm_set1_epi16(0xFF)));
+            __m512i g64 = _mm512_i32gather_epi64(lo32,
+                (const void*)iq2xxs_grid, 8);
+
+            // Sign indices from high bytes (masked to 7 bits)
+            __m128i hi8 = _mm_and_si128(
+                _mm_srli_epi16(qv, 8), _mm_set1_epi16(0x7F));
+
+            // Store gathered grid values â†?64 raw int8 bytes (no scalar extraction)
+            uint64_t gl[8];
+            _mm512_storeu_si512((__m512i*)gl, g64);
+
+            // Build 64-byte negation mask from sign bytes via LUT
+            uint8_t si16[16];
+            _mm_storeu_si128((__m128i*)si16, hi8);
+            uint64_t mask[8];
+            for (int qi = 0; qi < 8; qi++) {
+                mask[qi] = iq2xxs_sign_mask_lut[si16[qi * 2]];
             }
-            sumf += d * (float)dot;
+
+            // Load raw int8 weights and negation mask
+            __m512i w8_raw = _mm512_loadu_si512((const __m512i*)gl);
+            __m512i m8 = _mm512_loadu_si512((const __m512i*)mask);
+
+            // Conditional negation: sub(xor(w, mask), mask)
+            __m512i w8_signed = _mm512_sub_epi8(
+                _mm512_xor_si512(w8_raw, m8), m8);
+
+            // Extend int8 â†?int16 (two halves, 32 each)
+            __m256i w8_lo = _mm512_castsi512_si256(w8_signed);
+            __m256i w8_hi = _mm512_extracti64x4_epi64(w8_signed, 1);
+            __m512i w16_lo = _mm512_cvtepi8_epi16(w8_lo);
+            __m512i w16_hi = _mm512_cvtepi8_epi16(w8_hi);
+
+            // Load 64 int16 activations
+            __m512i a_lo = _mm512_loadu_si512((const __m512i*)(a16 + j * 8));
+            __m512i a_hi = _mm512_loadu_si512((const __m512i*)(a16 + j * 8 + 32));
+
+            // VPDPWSSD: int32 += int16 Ã— int16
+            __m512i vacc = _mm512_setzero_si512();
+            vacc = _mm512_dpwssd_epi32(vacc, w16_lo, a_lo);
+            vacc = _mm512_dpwssd_epi32(vacc, w16_hi, a_hi);
+
+            acc += _mm512_reduce_add_epi32(vacc);
         }
+
+        sumf += d * (float)acc;
     }
+
     *s += sumf;
 }
 
@@ -738,6 +975,15 @@ void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const void *x, const int16_t *y
 void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const void *x, const int16_t *y, float sy) {
     (void)n; (void)s; (void)x; (void)y; (void)sy;
 }
+void ds4_xeon_unpack_q4_k_to_u8(uint8_t *u8, float *sc8, float *m8, const void *x) {
+    (void)u8; (void)sc8; (void)m8; (void)x;
+}
+void ds4_xeon_dequant_q4_k_to_i16(int16_t *i16, const void *x) {
+    (void)i16; (void)x;
+}
+void ds4_xeon_unpack_q4_k_to_i16(int16_t *i16, const void *x) {
+    (void)i16; (void)x;
+}
 void ds4_xeon_rms_norm(float *o, const float *i, const float *w, int n, float e) {
     (void)o; (void)i; (void)w; (void)n; (void)e;
 }
@@ -816,7 +1062,7 @@ int ds4_xeon_predequant_init(
 {
     (void)out; (void)weights_ptr;
     (void)n_layer; (void)n_embd; (void)n_ff_exp; (void)n_expert;
-    // Stub â€” will be implemented in Phase 3 when tensor access patterns
+    // Stub â€?will be implemented in Phase 3 when tensor access patterns
     // from ds4.c are fully mapped. For now, existing Q4_K on-the-fly
     // dequant kernels are used.
     fprintf(stderr, "ds4_xeon: pre-dequant not yet implemented, "

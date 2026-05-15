@@ -117,6 +117,26 @@ void ds4_xeon_matmul_a16w16_vnni(
     int in_dim, int out_dim);
 
 // Q4_K dot product with int16 activation (existing, for W4A16 path)
+// === Q4_K Weight Unpack / Dequant ===
+
+// Extract 256 nibbles from a Q4_K block to uint8_t[256] (values 0-15).
+// The per-sub-block dequant parameters (d, dmin, sc[], m[]) are stored
+// in the output arrays sc8 and m8 (8 entries each) for later use.
+void ds4_xeon_unpack_q4_k_to_u8(
+    uint8_t *u8, float *sc8, float *m8,
+    const ds4_xeon_block_q4_K *x);
+
+// Extract 256 nibbles from a Q4_K block to int16_t (raw values 0-15).
+void ds4_xeon_unpack_q4_k_to_i16(
+    int16_t *i16, const ds4_xeon_block_q4_K *x);
+
+// Fully dequantize a Q4_K block to int16_t[256].
+// w16[k] = round(d * sc * q4 - dmin * m), clamped to [-32768, 32767].
+void ds4_xeon_dequant_q4_k_to_i16(
+    int16_t *i16, const ds4_xeon_block_q4_K *x);
+
+// === Q4_K VNNI Dot Products (existing) ===
+
 void ds4_xeon_vec_dot_q4_K_vnni(int n, float *s, const ds4_xeon_block_q4_K *x,
     const int16_t *y_i16, const int32_t *y_sum_32, float scale_y);
 

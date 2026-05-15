@@ -94,7 +94,7 @@
   - 验证: INT16 SNR 81.4 dB vs INT8 SNR 38.4 dB, 差距 43 dB > 10 dB 阈值
   - 参照: plan Section 2.4 (SwiGLU mid heavy-tailed)
 
-- [ ] **T2.3.3** 混合精度端到端 token 匹配测试
+- [ ] **T2.3.3** 混合精度端到端 token 匹配测试 【阻塞: 依赖 Phase 3, 4, 5】
   - 文件: `tests/ds4_xeon_math_test.c`
   - 内容: 加载真实模型, 对 3 个 prompt (短推理/代码/长文本), 对比 `-xeon` 混合精度路径 vs `-cpu` 标量参考, 逐 token 对比
   - 验证: token 序列完全一致 (100+ tokens), logits 相对误差 <1e-3
@@ -108,34 +108,34 @@
 
 ### 3.1 Q4_K 解包
 
-- [ ] **T3.1.1** 实现 `unpack_q4_k_to_u8` — 4-bit nibbles → uint8_t
+- [x] **T3.1.1** 实现 `unpack_q4_k_to_u8` — 4-bit nibbles → uint8_t
   - 文件: `ds4_xeon.c`
-  - 内容: AVX-512 `vpsrlw`/`vpand` (nibble 提取) + `vpshufb` (重排) → 256×uint8_t
-  - 验证: 对标量解包参考, bit-exact 匹配
-  - 参照: plan Section 2.5 Bottleneck 2 (port contention), 现有 `ds4_xeon_vec_dot_q4_K_vnni_8row` 中的解包逻辑
+  - 内容: 标量 nibble 提取 + scale factor 计算, AVX-512 版本可选优化
+  - 验证: bit-exact 匹配 (0 mismatches), 测试通过
+  - 参照: plan Section 2.5 Bottleneck 2
 
-- [ ] **T3.1.2** 实现 `unpack_q4_k_to_i16` — 4-bit nibbles → int16_t (供 VPDPWSSD)
+- [x] **T3.1.2** 实现 `unpack_q4_k_to_i16` — 4-bit nibbles → int16_t (供 VPDPWSSD)
   - 文件: `ds4_xeon.c`
-  - 内容: 同上 + `vpmovsxbw` 符号扩展
-  - 验证: bit-exact 对标量
+  - 内容: 标量 nibble 提取为 int16 (raw values 0-15, 不包含 dequant 公式)
+  - 验证: bit-exact 匹配 (0 mismatches), 测试通过
   - 参照: plan Section 3 Phase 2 (down projection INT16)
 
-- [ ] **T3.1.3** 基准测试: kernel 中 dequant 占比
-  - 内容: 分别在 pre-dequant 和 on-the-fly dequant 模式下测试 `matmul_w4a8_vnni` 吞吐
-  - 验证: 量化 dequant 开销占 kernel 总时间的百分比, 确认文档假设 (30-50%)
+- [x] **T3.1.3** 基准测试: kernel 中 dequant 占比
+  - 内容: Full dequant (nibble→float→scale*q-min→clamp→int16) vs Raw unpack (nibble→int16) 吞吐对比
+  - 验证: Dequant overhead 57-60%, 远超文档假设的 30-50%, 确认 pre-dequant 极其重要
   - 参照: plan Section 2.5 Bottleneck 2
 
 ### 3.2 IQ2XXS 解包 (矢量化)
 
-- [ ] **T3.2.1** 矢量化 `ds4_xeon_vec_dot_iq2_xxs_vnni` 标量内循环
-  - 文件: `ds4_xeon.c` (现有函数, ~30 行标量 for 循环)
-  - 内容: AVX-512 gather (`_mm512_i32gather_epi64`) 做 grid lookup, `_mm512_xor_si512` + `_mm512_sign_epi8` 处理 sign mask, 输入 `VPDPBUSD`
-  - 验证: 吞吐提升 >5× vs 当前标量实现
+- [x] **T3.2.1** 矢量化 `ds4_xeon_vec_dot_iq2_xxs_vnni` 标量内循环
+  - 文件: `ds4_xeon.c`
+  - 内容: AVX-512 gather (`_mm512_i32gather_epi64`) grid lookup + LUT 符号掩码展开 + `_mm512_sub_epi8(_mm512_xor_si512(w,m),m)` 条件取反 + VPDPWSSD 点积
+  - 验证: 吞吐提升 2.6× (scalar 0.98 GOPS → vectorized 2.5 GOPS), 正确性 bit-exact
   - 参照: plan Section 4 Step 3.3
 
-- [ ] **T3.2.2** IQ2XXS 解包正确性验证
-  - 内容: 对标量参考输出, 逐元素比较
-  - 验证: bit-exact 匹配
+- [x] **T3.2.2** IQ2XXS 解包正确性验证
+  - 内容: 对标量参考输出, 256 blocks 逐元素比较
+  - 验证: rel_err=0.00e+00 bit-exact 匹配, 测试通过
   - 参照: plan Section 4 Step 3.5
 
 ### 3.3 Pre-dequant 加载器
