@@ -15692,74 +15692,16 @@ static void ds4_xeon_ffn_shared_batch(
         }
     }
 
-    // --- T7.2: Per-expert batch GEMM (on-demand dequant) ---
-    ds4_xeon_predequant_weights *pw = &s->predequant;
-    bool expert_ready[DS4_N_EXPERT] = {0};
-    int buf = pw->current_buf;
-    const int block_size = 64;
-    const int a8_n_blocks = (int)DS4_N_EMBD / block_size;
-
-    for (int eid = 0; eid < DS4_N_EXPERT; eid++) {
-        int ne = h_cnt[eid];
-        if (ne == 0) continue;
-
-        // On-demand dequant: first use of this expert in this layer
-        if (!expert_ready[eid]) {
-            ds4_xeon_predequant_expert(pw, model, lw, eid);
-            expert_ready[eid] = true;
-        }
-
-        float *act_f32 = xmalloc((size_t)ne * DS4_N_EMBD * sizeof(float));
-        for (int i = 0; i < ne; i++) {
-            int t = h_sel[eid][i];
-            memcpy(act_f32 + (uint64_t)i * DS4_N_EMBD,
-                   h_norm + (uint64_t)t * DS4_N_EMBD, DS4_N_EMBD * sizeof(float));
-        }
-
-        int8_t *act_i8 = xmalloc((size_t)ne * DS4_N_EMBD);
-        float *act_scale = xmalloc((size_t)ne * a8_n_blocks * sizeof(float));
-        ds4_xeon_quantize_a8_per_block(act_i8, act_scale, act_f32,
-            ne, (int)DS4_N_EMBD, block_size);
-
-        float *gate_out = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(float));
-        float *up_out   = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(float));
-        const uint8_t *w_gate = pw->gate_up[buf]
-            + ((uint64_t)eid * 2 + 0) * (uint64_t)DS4_N_EMBD * DS4_N_FF_EXP;
-        const uint8_t *w_up = pw->gate_up[buf]
-            + ((uint64_t)eid * 2 + 1) * (uint64_t)DS4_N_EMBD * DS4_N_FF_EXP;
-        memset(gate_out, 0, (size_t)ne * DS4_N_FF_EXP * sizeof(float));
-        memset(up_out, 0, (size_t)ne * DS4_N_FF_EXP * sizeof(float));
-        ds4_xeon_matmul_a8w8_vnni_batch(gate_out, act_i8, act_scale,
-            w_gate, NULL, ne, (int)DS4_N_EMBD, (int)DS4_N_FF_EXP);
-        ds4_xeon_matmul_a8w8_vnni_batch(up_out, act_i8, act_scale,
-            w_up, NULL, ne, (int)DS4_N_EMBD, (int)DS4_N_FF_EXP);
-
-        float *mid_f32 = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(float));
-        ds4_xeon_swiglu(mid_f32, gate_out, up_out, ne * (int)DS4_N_FF_EXP);
-
-        int16_t *mid_i16 = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(int16_t));
-        float *mid_scale = xmalloc((size_t)ne * sizeof(float));
-        ds4_xeon_quantize_a16_per_token(mid_i16, mid_scale, mid_f32,
-            ne, (int)DS4_N_FF_EXP);
-
-        float *down_out = xcalloc((size_t)ne * DS4_N_EMBD, sizeof(float));
-        const int16_t *w_down = pw->down[buf]
-            + (uint64_t)eid * (uint64_t)DS4_N_FF_EXP * DS4_N_EMBD;
-        ds4_xeon_matmul_a16w16_vnni_batch(down_out, mid_i16, mid_scale,
-            w_down, NULL, ne, (int)DS4_N_FF_EXP, (int)DS4_N_EMBD);
-
-        // T7.3: Scatter (vectorized axpy)
-        for (int i = 0; i < ne; i++) {
-            int t = h_sel[eid][i];
-            ds4_xeon_axpy_f32(h_moe + (uint64_t)t * DS4_N_EMBD,
-                down_out + (uint64_t)i * DS4_N_EMBD,
-                h_ew[eid][i], (int)DS4_N_EMBD);
-        }
-
-        free(act_f32); free(act_i8); free(act_scale);
-        free(gate_out); free(up_out); free(mid_f32);
-        free(mid_i16); free(mid_scale); free(down_out);
+    // --- MoE: CPU instant matvec (bypass pre-dequant for small batch test) ---
+    for (int t = 0; t < n_tok; t++) {
+        float *norm = h_norm + (uint64_t)t * DS4_N_EMBD;
+        float *moe_t = h_moe + (uint64_t)t * DS4_N_EMBD;
+        float cpu_moe[DS4_N_EMBD];
+        memset(cpu_moe, 0, sizeof(cpu_moe));
+        layer_routed_moe_one(cpu_moe, model, lw, norm, il, tokens[t], -1.0f, false);
+        for (int d = 0; d < DS4_N_EMBD; d++) moe_t[d] += cpu_moe[d];
     }
+    (void)s;  // pre-dequant not used in this path
 
     // --- 3rd pass: Shared FFN + HC post ---
     for (int t = 0; t < n_tok; t++) {
