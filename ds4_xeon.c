@@ -1167,11 +1167,11 @@ int ds4_xeon_predequant_init(
     out->n_embd = n_embd;
     out->n_ff_exp = n_ff_exp;
 
-    // Compute per-buffer sizes
-    // gate_up: n_expert × 2(gate+up) × n_embd × n_ff_exp uint8
-    out->gate_up_bytes = (size_t)n_expert * 2 * n_embd * n_ff_exp;
-    // down: n_expert × n_ff_exp × n_embd int16
-    out->down_bytes = (size_t)n_expert * n_ff_exp * n_embd * sizeof(int16_t);
+    // Compute per-buffer sizes (cast to size_t to avoid 32-bit overflow)
+    // gate_up: n_expert × 2(gate+up) × n_embd × n_ff_exp uint8 = 4.0 GiB
+    out->gate_up_bytes = (size_t)n_expert * 2 * (size_t)n_embd * (size_t)n_ff_exp;
+    // down: n_expert × n_ff_exp × n_embd int16 = 4.0 GiB
+    out->down_bytes = (size_t)n_expert * (size_t)n_ff_exp * (size_t)n_embd * sizeof(int16_t);
 
     // Single buffer (per-layer dequant, 8.6 GB)
     for (int b = 0; b < 1; b++) {

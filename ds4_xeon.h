@@ -117,12 +117,23 @@ void ds4_xeon_matmul_a8w8_vnni(
     const uint8_t *w8, const float *w_scale,
     int in_dim, int out_dim);
 
+// Batched INT8 VNNI matmul for prefill (n_tok tokens)
+void ds4_xeon_matmul_a8w8_vnni_batch(
+    float *out, const int8_t *a8, const float *a8_scale,
+    const uint8_t *w8, const float *w_scale,
+    int n_tok, int in_dim, int out_dim);
+
 // INT16 VNNI matmul: activation (int16 per-token) × weight (int16) → float output
-// Fallback kernel for FFN down projection only (~30% of MACs)
 void ds4_xeon_matmul_a16w16_vnni(
     float *out, const int16_t *a16, float a_scale,
     const int16_t *w16, const float *w_scale,
     int in_dim, int out_dim);
+
+// Batched INT16 VNNI matmul for prefill
+void ds4_xeon_matmul_a16w16_vnni_batch(
+    float *out, const int16_t *a16, const float *a16_scale,
+    const int16_t *w16, const float *w_scale,
+    int n_tok, int in_dim, int out_dim);
 
 // Q4_K dot product with int16 activation (existing, for W4A16 path)
 // === Q4_K Weight Unpack / Dequant ===

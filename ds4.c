@@ -15586,22 +15586,22 @@ static void ds4_xeon_predequant_layer(
         }
     }
 
-    // Up experts (IQ2XXS → uint8)
+    // Up experts (IQ2XXS → uint8, same dims as gate)
     if (layer->ffn_up_exps && layer->ffn_up_exps->ndim == 3) {
-        uint64_t in_dim, out_dim, row_bytes;
-        const gguf_type_info *info = tensor_type(layer->ffn_up_exps->type);
+        uint64_t in_dim_u, out_dim_u, row_bytes_u;
+        const gguf_type_info *info_u = tensor_type(layer->ffn_up_exps->type);
         for (uint32_t e = 0; e < n_expert; e++) {
             const uint8_t *src = tensor_expert_bytes(model,
-                layer->ffn_up_exps, e, &in_dim, &out_dim, &row_bytes);
-            if (!info || info->block_elems == 0) continue;
-            uint64_t n_blocks = ((in_dim + info->block_elems - 1)
-                / info->block_elems) * out_dim;
+                layer->ffn_up_exps, e, &in_dim_u, &out_dim_u, &row_bytes_u);
+            if (!info_u || info_u->block_elems == 0) continue;
+            uint64_t n_blocks = ((in_dim_u + info_u->block_elems - 1)
+                / info_u->block_elems) * out_dim_u;
             uint8_t *dst = gate_up_dst
                 + ((uint64_t)e * 2 + 1) * (uint64_t)n_embd * n_ff;
             for (uint64_t b = 0; b < n_blocks; b++) {
                 const ds4_xeon_block_iq2_xxs *block =
                     (const ds4_xeon_block_iq2_xxs*)(
-                        src + b * info->block_bytes);
+                        src + b * info_u->block_bytes);
                 ds4_xeon_dequant_iq2xxs_block_to_u8(
                     dst + b * DS4_XEON_QK_K, block);
             }
@@ -15633,14 +15633,22 @@ static void ds4_xeon_predequant_layer(
 
 /* Xeon-optimized FFN batch with expert token regrouping (Phase 7).
  *
- * T7.1 complete: builds inverted index expert→[tokens] for batch GEMM.
- * T7.2 pending: actual batch GEMM needs pre-dequant weights from T3.3.1.
- * Currently routes per-expert matvecs through CPU for correctness;
- * the regrouping infrastructure enables drop-in VNNI batch GEMM later.
+ * T7.1: Builds inverted index expert→[tokens] during router pass.
+ * T7.2: Per-expert batch GEMM via VNNI matmul with pre-dequant weights.
+ * T7.3: Scatter batched results back to per-token MoE accumulator.
+ *
+ * Flow:
+ *   1st pass: HC pre + RMS norm + router for all tokens → store norm, HC state
+ *   2nd pass: for each expert with routed tokens:
+ *     gather norms → quantize int8 → gate/up matmul (VPDPBUSD) →
+ *     SwiGLU → quantize int16 → down matmul (VPDPWSSD) →
+ *     scatter weighted results
+ *   3rd pass: shared FFN per token + HC post
  */
 static void ds4_xeon_ffn_shared_batch(
         float             * cur_f32,
         ds4_engine        * e,
+        ds4_session       * s,
         const ds4_layer_weights * lw,
         const float       * next_f32,
         const int         * tokens,
@@ -15650,90 +15658,177 @@ static void ds4_xeon_ffn_shared_batch(
     const ds4_model *model = &e->model;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const float *ffn_norm_w = tensor_data(model, lw->ffn_norm);
+    const int block_size = 64;
+    const int a8_n_blocks = (int)DS4_N_EMBD / block_size;
 
-    // --- T7.1: Build expert → tokens inverted index ---
-    int   *expert_tokens[256] = {0};  // flat list of token indices per expert
-    float *expert_weights[256] = {0}; // corresponding gate weights
-    int    expert_count[256] = {0};
-    int    expert_cap[256] = {0};
+    // --- Per-token state for deferred processing ---
+    float *h_norm  = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(float));
+    float *h_post  = xmalloc((size_t)n_tok * DS4_N_HC * DS4_N_EMBD * sizeof(float));
+    float *h_comb  = xmalloc((size_t)n_tok * DS4_N_HC * DS4_N_HC * sizeof(float));
+    float *h_moe   = xcalloc((size_t)n_tok * DS4_N_EMBD, sizeof(float));
+    int   *h_sel[DS4_N_EXPERT] = {0};   // expert → token indices
+    float *h_ew[DS4_N_EXPERT]  = {0};   // expert → gate weights
+    int    h_cnt[DS4_N_EXPERT] = {0};
+    int    h_cap[DS4_N_EXPERT] = {0};
+
+    // --- T7.1: 1st pass — HC pre + RMS norm + router ---
     for (int t = 0; t < n_tok; t++) {
         const float *inp_hc = next_f32 + (uint64_t)t * hc_dim;
         float *out_hc = cur_f32 + (uint64_t)t * hc_dim;
+        float *post   = h_post + (uint64_t)t * DS4_N_HC * DS4_N_EMBD;
+        float *comb   = h_comb + (uint64_t)t * DS4_N_HC * DS4_N_HC;
 
         // HC pre-FFN
-        float hc_ffn_inp[DS4_N_HC * DS4_N_EMBD];
-        float hc_ffn_post[DS4_N_HC * DS4_N_EMBD];
-        float hc_ffn_comb[DS4_N_HC * DS4_N_HC];
-        hc_pre_from_state_one(model,
-            lw->hc_ffn_fn, lw->hc_ffn_scale, lw->hc_ffn_base,
-            inp_hc, hc_ffn_inp, hc_ffn_post, hc_ffn_comb);
+        float hc_inp[DS4_N_HC * DS4_N_EMBD];
+        hc_pre_from_state_one(model, lw->hc_ffn_fn, lw->hc_ffn_scale,
+            lw->hc_ffn_base, inp_hc, hc_inp, post, comb);
         memcpy(out_hc, inp_hc, hc_dim * sizeof(float));
 
         // RMS Norm
-        float norm[DS4_N_EMBD];
-        rms_norm_weight(norm, hc_ffn_inp, ffn_norm_w,
-            DS4_N_EMBD, DS4_RMS_EPS);
+        float *norm = h_norm + (uint64_t)t * DS4_N_EMBD;
+        rms_norm_weight(norm, hc_inp, ffn_norm_w, DS4_N_EMBD, DS4_RMS_EPS);
 
-        // Router: top-k expert selection (CPU, low compute)
-        int selected[DS4_N_EXPERT_USED];
-        float exp_w[DS4_N_EXPERT_USED];
-        memset(selected, 0, sizeof(selected));
-        memset(exp_w, 0, sizeof(exp_w));
-        if (lw->ffn_gate_inp) {
-            layer_topk_selected_experts(selected, exp_w, model, lw, norm);
-        }
+        // Router
+        int sel[DS4_N_EXPERT_USED];
+        float ew[DS4_N_EXPERT_USED];
+        memset(sel, 0, sizeof(sel)); memset(ew, 0, sizeof(ew));
+        if (lw->ffn_gate_inp)
+            layer_topk_selected_experts(sel, ew, model, lw, norm);
 
-        // Add to inverted index
         for (uint32_t ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
-            int eid = selected[ei];
+            int eid = sel[ei];
             if (eid < 0 || eid >= DS4_N_EXPERT) continue;
-            if (fabsf(exp_w[ei]) < 1e-9f) continue;
-            if (expert_count[eid] >= expert_cap[eid]) {
-                int nc = expert_cap[eid] == 0 ? 4 : expert_cap[eid] * 2;
-                expert_tokens[eid] = xrealloc(expert_tokens[eid], (size_t)nc * sizeof(int));
-                expert_weights[eid] = xrealloc(expert_weights[eid], (size_t)nc * sizeof(float));
-                expert_cap[eid] = nc;
+            if (fabsf(ew[ei]) < 1e-9f) continue;
+            if (h_cnt[eid] >= h_cap[eid]) {
+                int nc = h_cap[eid] == 0 ? 4 : h_cap[eid] * 2;
+                h_sel[eid] = xrealloc(h_sel[eid], (size_t)nc * sizeof(int));
+                h_ew[eid]  = xrealloc(h_ew[eid],  (size_t)nc * sizeof(float));
+                h_cap[eid] = nc;
             }
-            expert_tokens[eid][expert_count[eid]] = t;
-            expert_weights[eid][expert_count[eid]] = exp_w[ei];
-            expert_count[eid]++;
+            h_sel[eid][h_cnt[eid]] = t;
+            h_ew[eid][h_cnt[eid]]  = ew[ei];
+            h_cnt[eid]++;
+        }
+    }
+
+    // --- T7.2: Per-expert batch GEMM with pre-dequant weights ---
+    ds4_xeon_predequant_weights *pw = &s->predequant;
+    int buf = pw->current_buf;
+
+    for (int eid = 0; eid < DS4_N_EXPERT; eid++) {
+        int ne = h_cnt[eid];
+        if (ne == 0) continue;
+
+        // Allocate temp buffers for this expert batch
+        float  *act_f32  = xmalloc((size_t)ne * DS4_N_EMBD * sizeof(float));
+        int8_t *act_i8   = xmalloc((size_t)ne * DS4_N_EMBD * sizeof(int8_t));
+        float  *act_scale = xmalloc((size_t)ne * a8_n_blocks * sizeof(float));
+        float  *gate_out  = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(float));
+        float  *up_out    = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(float));
+        float  *down_out  = xcalloc((size_t)ne * DS4_N_EMBD, sizeof(float));
+
+        // Gather norms for tokens routed to this expert
+        for (int i = 0; i < ne; i++) {
+            int t = h_sel[eid][i];
+            memcpy(act_f32 + (uint64_t)i * DS4_N_EMBD,
+                   h_norm + (uint64_t)t * DS4_N_EMBD,
+                   DS4_N_EMBD * sizeof(float));
         }
 
-        // --- Per-token MoE + shared FFN (CPU path for now) ---
-        float moe_out[DS4_N_EMBD];
-        memset(moe_out, 0, sizeof(moe_out));
-        layer_routed_moe_one(moe_out, model, lw, norm, il, tokens[t], -1.0f, false);
+        // Quantize activations to int8
+        ds4_xeon_quantize_a8_per_block(act_i8, act_scale, act_f32,
+            ne, (int)DS4_N_EMBD, block_size);
 
+        // Gate projection: [ne][n_embd] × [n_embd][n_ff_exp] → [ne][n_ff_exp]
+        const uint8_t *w_gate = pw->gate_up[buf]
+            + ((uint64_t)eid * 2 + 0) * (uint64_t)DS4_N_EMBD * DS4_N_FF_EXP;
+        memset(gate_out, 0, (size_t)ne * DS4_N_FF_EXP * sizeof(float));
+        ds4_xeon_matmul_a8w8_vnni_batch(gate_out, act_i8, act_scale,
+            w_gate, NULL, ne, (int)DS4_N_EMBD, (int)DS4_N_FF_EXP);
+
+        // Up projection: same layout
+        const uint8_t *w_up = pw->gate_up[buf]
+            + ((uint64_t)eid * 2 + 1) * (uint64_t)DS4_N_EMBD * DS4_N_FF_EXP;
+        memset(up_out, 0, (size_t)ne * DS4_N_FF_EXP * sizeof(float));
+        ds4_xeon_matmul_a8w8_vnni_batch(up_out, act_i8, act_scale,
+            w_up, NULL, ne, (int)DS4_N_EMBD, (int)DS4_N_FF_EXP);
+
+        // SwiGLU: mid = SiLU(gate) * up
+        float *mid_f32 = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(float));
+        for (int i = 0; i < ne * (int)DS4_N_FF_EXP; i++) {
+            float g = gate_out[i];
+            float silu = g / (1.0f + expf(-g));  // SiLU
+            mid_f32[i] = silu * up_out[i];
+        }
+
+        // Quantize SwiGLU output to int16 (per-token)
+        int16_t *mid_i16 = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(int16_t));
+        float   *mid_scale = xmalloc((size_t)ne * sizeof(float));
+        ds4_xeon_quantize_a16_per_token(mid_i16, mid_scale, mid_f32,
+            ne, (int)DS4_N_FF_EXP);
+
+        // Down projection: [ne][n_ff_exp] × [n_ff_exp][n_embd] → [ne][n_embd]
+        const int16_t *w_down = pw->down[buf]
+            + (uint64_t)eid * (uint64_t)DS4_N_FF_EXP * DS4_N_EMBD;
+        ds4_xeon_matmul_a16w16_vnni_batch(down_out, mid_i16, mid_scale,
+            w_down, NULL, ne, (int)DS4_N_FF_EXP, (int)DS4_N_EMBD);
+
+        // T7.3: Scatter results back to per-token MoE accumulator
+        for (int i = 0; i < ne; i++) {
+            int t = h_sel[eid][i];
+            float ew = h_ew[eid][i];
+            float *moe_t = h_moe + (uint64_t)t * DS4_N_EMBD;
+            float *down_i = down_out + (uint64_t)i * DS4_N_EMBD;
+            for (uint32_t d = 0; d < DS4_N_EMBD; d++)
+                moe_t[d] += ew * down_i[d];
+        }
+
+        free(act_f32); free(act_i8); free(act_scale);
+        free(gate_out); free(up_out);
+        free(mid_f32); free(mid_i16); free(mid_scale);
+        free(down_out);
+    }
+
+    // --- 3rd pass: Shared FFN + HC post (per token) ---
+    for (int t = 0; t < n_tok; t++) {
+        float *out_hc = cur_f32 + (uint64_t)t * hc_dim;
+        const float *inp_hc = next_f32 + (uint64_t)t * hc_dim;
+        float *norm = h_norm + (uint64_t)t * DS4_N_EMBD;
+
+        // Shared FFN
         float shared_out[DS4_N_EMBD];
         memset(shared_out, 0, sizeof(shared_out));
         layer_shared_ffn_one(shared_out, model, lw, norm);
 
+        // Combine MoE + shared
+        float *moe_t = h_moe + (uint64_t)t * DS4_N_EMBD;
         for (int d = 0; d < DS4_N_EMBD; d++)
-            moe_out[d] += shared_out[d];
+            moe_t[d] += shared_out[d];
 
         // HC post-FFN
-        hc_post_one(out_hc, moe_out, inp_hc, hc_ffn_post, hc_ffn_comb,
+        hc_post_one(out_hc, moe_t, inp_hc,
+            h_post + (uint64_t)t * DS4_N_HC * DS4_N_EMBD,
+            h_comb + (uint64_t)t * DS4_N_HC * DS4_N_HC,
             DS4_N_EMBD, DS4_N_HC);
     }
 
-    // T7.6: Log expert load distribution (once per layer)
+    // T7.6: Expert load stats (layer 0 only)
     if (il == 0 && n_tok > 1) {
-        int active_experts = 0;
-        int max_load = 0;
+        int n_active = 0, max_load = 0;
         for (int e = 0; e < DS4_N_EXPERT; e++) {
-            if (expert_count[e] > 0) active_experts++;
-            if (expert_count[e] > max_load) max_load = expert_count[e];
+            if (h_cnt[e] > 0) n_active++;
+            if (h_cnt[e] > max_load) max_load = h_cnt[e];
         }
-        fprintf(stderr, "ds4: layer 0 expert load: %d/%d active, max=%d "
-                "(avg=%.1f)\n", active_experts, (int)DS4_N_EXPERT, max_load,
-                (double)n_tok * DS4_N_EXPERT_USED / (double)DS4_N_EXPERT);
+        fprintf(stderr, "ds4: expert load: %d/%d active, max=%d (avg=%.1f)\n",
+            n_active, (int)DS4_N_EXPERT, max_load,
+            (double)n_tok * DS4_N_EXPERT_USED / (double)DS4_N_EXPERT);
     }
 
-    // Cleanup inverted index
+    // Cleanup
     for (int e = 0; e < DS4_N_EXPERT; e++) {
-        free(expert_tokens[e]);
-        free(expert_weights[e]);
+        free(h_sel[e]); free(h_ew[e]);
     }
+    free(h_norm); free(h_post); free(h_comb); free(h_moe);
 }
 
 /* High-performance Xeon prefill using the static graph and VNNI math. */
@@ -15777,9 +15872,10 @@ static void prefill_xeon_graph(
                                       e->directional_steering_dirs,
                                       e->directional_steering_attn_scale);
 
-        // 2. FFN (Xeon High-Performance Path)
+        // 2. FFN (Xeon High-Performance Path, Phase 7 batch GEMM)
         ds4_xeon_ffn_shared_batch(cur_f32,
                                   e,
+                                  s,
                                   lw,
                                   next_f32,
                                   prompt->v,
