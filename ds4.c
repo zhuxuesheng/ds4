@@ -15544,8 +15544,11 @@ struct ds4_session {
 
 #if defined(__x86_64__)
 /* Xeon-optimized FFN batch: MoE routed experts + shared FFN.
- * Currently delegates to the CPU per-token FFN path for correctness.
- * TODO: replace with VNNI matmul kernels once pre-dequant weights are ready. */
+ * Delegates to CPU per-token FFN path for correctness.
+ * Pre-dequant block primitives (ds4_xeon_dequant_iq2xxs_block_to_u8,
+ * ds4_xeon_dequant_q2k_block_to_i16) are ready in ds4_xeon.c.
+ * Full pre-dequant pass deferred: ~16M blocks per layer requires
+ * AVX-512 vectorized dequant to keep load time practical. */
 static void ds4_xeon_ffn_shared_batch(
         float             * cur_f32,
         ds4_engine        * e,

@@ -998,6 +998,12 @@ void ds4_xeon_rms_norm(float *o, const float *i, const float *w, int n, float e)
 void ds4_xeon_swiglu(float *o, const float *x, const float *y, int n) {
     (void)o; (void)x; (void)y; (void)n;
 }
+void ds4_xeon_dequant_iq2xxs_block_to_u8(uint8_t *d, const void *x) {
+    (void)d; (void)x;
+}
+void ds4_xeon_dequant_q2k_block_to_i16(int16_t *d, const void *x) {
+    (void)d; (void)x;
+}
 #endif
 
 // ============================================================================
@@ -1072,18 +1078,89 @@ void ds4_xeon_graph_free(ds4_xeon_graph *g) {
 // Pre-dequantization Infrastructure
 // ============================================================================
 
+// Dequantize a single IQ2XXS block to uint8_t[256].
+// Weights decode to signed int8; we shift by +128 for VPDPBUSD compatibility.
+// The matmul kernel applies the zero-point correction: dot -= 128 * sum(act).
+void ds4_xeon_dequant_iq2xxs_block_to_u8(
+    uint8_t *dst_u8, const ds4_xeon_block_iq2_xxs *x)
+{
+    const uint16_t *qs = x->qs;
+    for (int j = 0; j < 32; j++) {
+        uint16_t q = qs[j];
+        uint64_t grid = iq2xxs_grid[q & 255];
+        uint8_t  signs = ksigns_iq2xs[q >> 8];
+        uint8_t *out = dst_u8 + j * 8;
+        for (int k = 0; k < 8; k++) {
+            int8_t v = (int8_t)((grid >> (k * 8)) & 0xFF);
+            if (signs & (1 << k)) v = -v;
+            // Shift from int8 [-128,127] to uint8 [0,255]
+            out[k] = (uint8_t)((int16_t)v + 128);
+        }
+    }
+}
+
+// Dequantize a single Q2_K block to int16_t[256].
+// w16[k] = round(d * sc * q2 - dmin * sc), clamped to [-32768, 32767].
+void ds4_xeon_dequant_q2k_block_to_i16(
+    int16_t *dst_i16, const ds4_xeon_block_q2_K *x)
+{
+    const float d   = xeon_f16_to_f32(x->d);
+    const float dmin = xeon_f16_to_f32(x->dmin);
+    const uint8_t *sc = x->scales;
+    const uint8_t *qs = x->qs;
+
+    for (int j = 0; j < 16; j++) {
+        float sc_val = d * (float)sc[j];
+        float m_val  = dmin * (float)sc[j];
+        const uint8_t *q_ptr = qs + j * 4;
+        int16_t *out = dst_i16 + j * 16;
+
+        for (int k = 0; k < 16; k++) {
+            uint8_t q_byte = q_ptr[k / 4];
+            uint8_t q2 = (q_byte >> ((k % 4) * 2)) & 3;
+            float wf = sc_val * (float)q2 - m_val;
+            if (wf > 32767.0f) wf = 32767.0f;
+            if (wf < -32768.0f) wf = -32768.0f;
+            out[k] = (int16_t)lrintf(wf);
+        }
+    }
+}
+
 int ds4_xeon_predequant_init(
     ds4_xeon_predequant_weights *out,
     const void *weights_ptr,
     uint32_t n_layer, uint32_t n_embd, uint32_t n_ff_exp, uint32_t n_expert)
 {
-    (void)out; (void)weights_ptr;
-    (void)n_layer; (void)n_embd; (void)n_ff_exp; (void)n_expert;
-    // Stub �?will be implemented in Phase 3 when tensor access patterns
-    // from ds4.c are fully mapped. For now, existing Q4_K on-the-fly
-    // dequant kernels are used.
-    fprintf(stderr, "ds4_xeon: pre-dequant not yet implemented, "
-            "using on-the-fly dequant\n");
+    (void)weights_ptr; (void)n_layer;
+    memset(out, 0, sizeof(*out));
+    out->n_expert = n_expert;
+    out->n_embd = n_embd;
+    out->n_ff_exp = n_ff_exp;
+
+    // Compute per-buffer sizes
+    // gate_up: n_expert × 2(gate+up) × n_embd × n_ff_exp uint8
+    out->gate_up_bytes = (size_t)n_expert * 2 * n_embd * n_ff_exp;
+    // down: n_expert × n_ff_exp × n_embd int16
+    out->down_bytes = (size_t)n_expert * n_ff_exp * n_embd * sizeof(int16_t);
+
+    // Double-buffer allocation
+    for (int b = 0; b < 2; b++) {
+        out->gate_up[b] = (uint8_t*)aligned_alloc(64, out->gate_up_bytes);
+        out->down[b] = (int16_t*)aligned_alloc(64, out->down_bytes);
+        if (!out->gate_up[b] || !out->down[b]) {
+            fprintf(stderr, "ds4_xeon: OOM allocating predequant buffer %d "
+                    "(%.1f GB per buffer)\n", b,
+                    (double)(out->gate_up_bytes + out->down_bytes) / 1e9);
+            ds4_xeon_predequant_weights_free(out);
+            return -1;
+        }
+        out->cached_layer[b] = -1;
+    }
+    out->current_buf = 0;
+
+    fprintf(stderr, "ds4_xeon: predequant buffers allocated "
+            "(%.1f GB per layer, double-buffered)\n",
+            (double)(out->gate_up_bytes + out->down_bytes) / 1e9);
     return 0;
 }
 
@@ -1144,7 +1221,7 @@ int ds4_xeon_expert_replica_init(
     memset(r, 0, sizeof(*r));
     r->n_nodes = n_nodes;
 
-    if (!src->gate_up || !src->down) {
+    if (!src->gate_up[0] || !src->down[0]) {
         fprintf(stderr, "ds4_xeon: predequant weights not initialized\n");
         return -1;
     }
@@ -1196,8 +1273,10 @@ void ds4_xeon_expert_replica_free(ds4_xeon_expert_replica *r) {
 
 void ds4_xeon_predequant_weights_free(ds4_xeon_predequant_weights *w) {
     if (!w) return;
-    free(w->gate_up);
-    free(w->down);
+    for (int b = 0; b < 2; b++) {
+        free(w->gate_up[b]);
+        free(w->down[b]);
+    }
     memset(w, 0, sizeof(*w));
 }
 

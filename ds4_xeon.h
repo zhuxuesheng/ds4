@@ -29,20 +29,18 @@ typedef struct {
     uint16_t qs[DS4_XEON_QK_K / 8];
 } ds4_xeon_block_iq2_xxs;
 
-// Pre-dequantized weight buffers (allocated at model load time)
+// Pre-dequantized weight buffers (per-layer caching, double-buffered)
 typedef struct {
-    // Expert weights dequantized to int8 for VPDPBUSD (gate + up projections)
-    // Layout: [n_expert][3][n_blocks * QK_K]  (3 = gate, up, down; down is int16)
-    uint8_t *gate_up;     // gate + up projections, uint8 for VPDPBUSD
-    int16_t *down;        // down projection, int16 for VPDPWSSD (SwiGLU mid input)
-    // Shared FFN weights (Q8_0 format, already uint8)
-    const void *shared_gate; // pointer to Q8_0 tensor data
-    const void *shared_up;
-    const void *shared_down;
-    // Attention weights (Q8_0 format, already uint8)
-    const void *attn_q_a;
-    const void *attn_kv;
-    const void *attn_output_b;
+    // Expert weights dequantized for one layer at a time
+    // gate_up: concatenated gate + up projection experts → uint8 for VPDPBUSD
+    // Layout: [n_expert][2][n_embd][n_ff_exp] (gate then up, interleaved)
+    uint8_t *gate_up[2]; // double-buffered: [0]=current, [1]=next
+    int16_t *down[2];    // down projection, int16 for VPDPWSSD
+    int      current_buf; // which buffer is "current" (0 or 1)
+    int      cached_layer[2]; // which layer is cached in each buffer (-1 = none)
+    size_t   gate_up_bytes; // per-buffer gate+up size
+    size_t   down_bytes;    // per-buffer down size
+    uint32_t n_expert, n_embd, n_ff_exp;
 } ds4_xeon_predequant_weights;
 
 // Static execution graph for Xeon Backend (mixed precision)
@@ -206,6 +204,17 @@ void ds4_xeon_threads_bind(int numa_node);
 void ds4_xeon_threads_init(void);
 
 // === Weight Pre-dequantization ===
+
+// Dequantize a single IQ2XXS block (66 bytes → 256 uint8).
+// Output range [0,255] (shifted from signed int8 for VPDPBUSD).
+void ds4_xeon_dequant_iq2xxs_block_to_u8(
+    uint8_t *dst_u8, const ds4_xeon_block_iq2_xxs *x);
+
+// Dequantize a single Q2_K block (84 bytes → 256 int16).
+// Output clamped to [-32768, 32767] for VPDPWSSD.
+void ds4_xeon_dequant_q2k_block_to_i16(
+    int16_t *dst_i16, const ds4_xeon_block_q2_K *x);
+
 // Expand Q4_K/IQ2XXS weights to contiguous uint8/int16 buffers at load time.
 // Returns 0 on success, -1 on allocation failure.
 int ds4_xeon_predequant_init(
