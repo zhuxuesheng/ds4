@@ -15650,10 +15650,10 @@ static void ds4_xeon_ffn_shared_batch(
     float *h_post  = xmalloc((size_t)n_tok * DS4_N_HC * DS4_N_EMBD * sizeof(float));
     float *h_comb  = xmalloc((size_t)n_tok * DS4_N_HC * DS4_N_HC * sizeof(float));
     float *h_moe   = xcalloc((size_t)n_tok * DS4_N_EMBD, sizeof(float));
-    int   *h_sel[DS4_N_EXPERT] = {0};
-    float *h_ew[DS4_N_EXPERT]  = {0};
+    int   h_token_sel[256][DS4_N_EXPERT_USED];  // per-token selected experts
+    float h_token_ew[256][DS4_N_EXPERT_USED];   // per-token expert weights
     int    h_cnt[DS4_N_EXPERT] = {0};
-    int    h_cap[DS4_N_EXPERT] = {0};
+    (void)h_cnt;  // unused now, kept for expert load stats
 
     // --- T7.1: 1st pass — HC pre + RMS norm + router ---
     for (int t = 0; t < n_tok; t++) {
@@ -15678,30 +15678,43 @@ static void ds4_xeon_ffn_shared_batch(
 
         for (uint32_t ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
             int eid = sel[ei];
-            if (eid < 0 || eid >= DS4_N_EXPERT) continue;
-            if (fabsf(ew[ei]) < 1e-9f) continue;
-            if (h_cnt[eid] >= h_cap[eid]) {
-                int nc = h_cap[eid] == 0 ? 4 : h_cap[eid] * 2;
-                h_sel[eid] = xrealloc(h_sel[eid], (size_t)nc * sizeof(int));
-                h_ew[eid]  = xrealloc(h_ew[eid],  (size_t)nc * sizeof(float));
-                h_cap[eid] = nc;
+            if (eid < 0 || eid >= DS4_N_EXPERT) {
+                h_token_sel[t][ei] = -1;
+                h_token_ew[t][ei] = 0.0f;
+            } else {
+                h_token_sel[t][ei] = eid;
+                h_token_ew[t][ei] = ew[ei];
+                h_cnt[eid]++;
             }
-            h_sel[eid][h_cnt[eid]] = t;
-            h_ew[eid][h_cnt[eid]]  = ew[ei];
-            h_cnt[eid]++;
         }
     }
 
-    // --- MoE: CPU instant matvec (bypass pre-dequant for small batch test) ---
+    // --- MoE: AVX-512 instant matvec via ds4_xeon_routed_moe_one_expert ---
     for (int t = 0; t < n_tok; t++) {
         float *norm = h_norm + (uint64_t)t * DS4_N_EMBD;
         float *moe_t = h_moe + (uint64_t)t * DS4_N_EMBD;
-        float cpu_moe[DS4_N_EMBD];
-        memset(cpu_moe, 0, sizeof(cpu_moe));
-        layer_routed_moe_one(cpu_moe, model, lw, norm, il, tokens[t], -1.0f, false);
-        for (int d = 0; d < DS4_N_EMBD; d++) moe_t[d] += cpu_moe[d];
+
+        for (uint32_t ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
+            int eid = h_token_sel[t][ei];
+            if (eid < 0) continue;
+            float ew = h_token_ew[t][ei];
+            if (fabsf(ew) < 1e-9f) continue;
+
+            uint64_t in_dim, out_dim, row_bytes;
+            const uint8_t *gate_data = tensor_expert_bytes(model,
+                lw->ffn_gate_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
+            uint64_t grb = row_bytes;
+            const uint8_t *up_data = tensor_expert_bytes(model,
+                lw->ffn_up_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
+            uint64_t urb = row_bytes;
+            const uint8_t *down_data = tensor_expert_bytes(model,
+                lw->ffn_down_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
+
+            ds4_xeon_routed_moe_one_expert(moe_t, norm,
+                gate_data, up_data, down_data, grb, urb, row_bytes, ew);
+        }
     }
-    (void)s;  // pre-dequant not used in this path
+    (void)s; (void)il; (void)tokens;
 
     // --- 3rd pass: Shared FFN + HC post ---
     for (int t = 0; t < n_tok; t++) {
@@ -15735,9 +15748,6 @@ static void ds4_xeon_ffn_shared_batch(
             (double)n_tok * DS4_N_EXPERT_USED / (double)DS4_N_EXPERT);
     }
 
-    for (int e = 0; e < DS4_N_EXPERT; e++) {
-        free(h_sel[e]); free(h_ew[e]);
-    }
     free(h_norm); free(h_post); free(h_comb); free(h_moe);
     (void)tokens;
 }
@@ -17507,8 +17517,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_HC,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_N_LAYER,
                 -1 /* numa interleaved */);
-            ds4_xeon_predequant_init(&s->predequant, NULL,
-                DS4_N_LAYER, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            // Pre-dequant disabled: using instant matvec path instead
+            // ds4_xeon_predequant_init(&s->predequant, NULL, ...);
         }
 #endif
         *out = s;
@@ -17557,7 +17567,7 @@ void ds4_session_free(ds4_session *s) {
 #if defined(__x86_64__)
         if (s->engine && s->engine->backend == DS4_BACKEND_XEON) {
             ds4_xeon_graph_free(&s->xeon_graph);
-            ds4_xeon_predequant_weights_free(&s->predequant);
+            // ds4_xeon_predequant_weights_free(&s->predequant);
         }
 #endif
     }

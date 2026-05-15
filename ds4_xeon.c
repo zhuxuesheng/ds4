@@ -942,6 +942,81 @@ void ds4_xeon_rms_norm(float *out, const float *in, const float *w, int n, float
 }
 
 // ============================================================================
+// Xeon Routed MoE — AVX-512 instant matvec per expert
+// ============================================================================
+// Process one token through one expert: gate → up → SiLU → down → accumulate.
+// Uses ds4_xeon_vec_dot_iq2_xxs_vnni for gate/up, ds4_xeon_vec_dot_q2_K_vnni for down.
+// Called from ds4.c wrapper for each token × expert pair.
+void ds4_xeon_routed_moe_one_expert(
+    float *out,                    // [DS4_N_EMBD] output accumulator
+    const float *x,                // [DS4_N_EMBD] input activation (RMS-normed)
+    const uint8_t *gate_blocks,    // IQ2XXS gate expert blocks (row-major)
+    const uint8_t *up_blocks,      // IQ2XXS up expert blocks
+    const uint8_t *down_blocks,    // Q2_K down expert blocks
+    uint64_t gate_row_bytes,       // bytes per gate output row
+    uint64_t up_row_bytes,         // bytes per up output row
+    uint64_t down_row_bytes,       // bytes per down output row
+    float expert_weight)           // router weight for this expert
+{
+    // Pre-allocated buffers (from graph, avoids malloc in hot loop)
+    // Using static for now; TODO: use ds4_xeon_graph buffers for thread safety
+    __attribute__((aligned(64))) static int16_t act_i16[DS4_N_EMBD];
+    __attribute__((aligned(64))) static float  gate[DS4_N_FF_EXP];
+    __attribute__((aligned(64))) static float  up[DS4_N_FF_EXP];
+    __attribute__((aligned(64))) static float  mid[DS4_N_FF_EXP];
+    __attribute__((aligned(64))) static int16_t mid_i16[DS4_N_FF_EXP];
+    __attribute__((aligned(64))) static int32_t mid_sums[DS4_N_FF_EXP / 32];
+
+    // Quantize input to int16 for IQ2XXS dot products
+    float act_scale;
+    ds4_xeon_quantize_a16_per_token(act_i16, &act_scale, x, 1, DS4_N_EMBD);
+    act_scale = 1.0f / act_scale;
+
+    // Gate projection: [DS4_N_EMBD] → [DS4_N_FF_EXP]
+    for (uint32_t r = 0; r < DS4_N_FF_EXP; r++) {
+        const ds4_xeon_block_iq2_xxs *blocks =
+            (const ds4_xeon_block_iq2_xxs*)(gate_blocks + r * gate_row_bytes);
+        float dot = 0.0f;
+        ds4_xeon_vec_dot_iq2_xxs_vnni(DS4_N_EMBD, &dot, blocks, act_i16, act_scale);
+        gate[r] = dot;
+    }
+
+    // Up projection
+    for (uint32_t r = 0; r < DS4_N_FF_EXP; r++) {
+        const ds4_xeon_block_iq2_xxs *blocks =
+            (const ds4_xeon_block_iq2_xxs*)(up_blocks + r * up_row_bytes);
+        float dot = 0.0f;
+        ds4_xeon_vec_dot_iq2_xxs_vnni(DS4_N_EMBD, &dot, blocks, act_i16, act_scale);
+        up[r] = dot;
+    }
+
+    // SwiGLU: mid = SiLU(gate) * up
+    ds4_xeon_swiglu(mid, gate, up, DS4_N_FF_EXP);
+
+    // Quantize mid to int16 for Q2_K down
+    float mid_scale;
+    ds4_xeon_quantize_a16_per_token(mid_i16, &mid_scale, mid, 1, DS4_N_FF_EXP);
+    mid_scale = 1.0f / mid_scale;
+
+    // Pre-compute int32 sums for Q2_K
+    for (int i = 0; i < DS4_N_FF_EXP / 32; i++) {
+        int32_t sum = 0;
+        for (int j = 0; j < 32; j++)
+            sum += (int32_t)mid_i16[i * 32 + j];
+        mid_sums[i] = sum;
+    }
+
+    // Down projection: [DS4_N_FF_EXP] → [DS4_N_EMBD]
+    for (uint32_t r = 0; r < DS4_N_EMBD; r++) {
+        const ds4_xeon_block_q2_K *blocks =
+            (const ds4_xeon_block_q2_K*)(down_blocks + r * down_row_bytes);
+        float dot = 0.0f;
+        ds4_xeon_vec_dot_q2_K_vnni(DS4_N_FF_EXP, &dot, blocks, mid_i16, mid_sums, mid_scale);
+        out[r] += expert_weight * dot;
+    }
+}
+
+// ============================================================================
 // Attention Scores (AVX-512) — QK^T + softmax + weighted sum
 // ============================================================================
 // Compute attention for n_tok tokens with causal masking.
@@ -1100,6 +1175,12 @@ void ds4_xeon_dequant_q2k_block_to_i16(int16_t *d, const void *x) {
 }
 void ds4_xeon_attn_scores(float *h, const float *q, const float *kv, uint32_t n, uint32_t il) {
     (void)h; (void)q; (void)kv; (void)n; (void)il;
+}
+void ds4_xeon_routed_moe_one_expert(float *o, const float *x,
+    const uint8_t *g, const uint8_t *u, const uint8_t *d,
+    uint64_t grb, uint64_t urb, uint64_t drb, float ew) {
+    (void)o; (void)x; (void)g; (void)u; (void)d;
+    (void)grb; (void)urb; (void)drb; (void)ew;
 }
 void ds4_xeon_axpy_f32(float *y, const float *x, float a, int n) {
     for (int i = 0; i < n; i++) y[i] += a * x[i];

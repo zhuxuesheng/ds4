@@ -171,6 +171,16 @@ void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
 void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs *x,
     const int16_t *y_i16, float scale_y);
 
+// Xeon AVX-512 routed MoE: one expert's gate→up→SiLU→down
+// out: [DS4_N_EMBD] accumulator, x: [DS4_N_EMBD] RMS-normed input
+// gate/up_blocks: IQ2XXS row-major, down_blocks: Q2_K row-major
+void ds4_xeon_routed_moe_one_expert(
+    float *out, const float *x,
+    const uint8_t *gate_blocks, const uint8_t *up_blocks,
+    const uint8_t *down_blocks,
+    uint64_t gate_row_bytes, uint64_t up_row_bytes,
+    uint64_t down_row_bytes, float expert_weight);
+
 // === Attention ===
 
 // AVX-512 attention scores: QK^T + softmax + weighted sum (causal masking)
