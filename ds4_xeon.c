@@ -1131,6 +1131,7 @@ void ds4_xeon_dequant_iq2xxs_block_to_u8(
 
 // Dequantize a single Q2_K block to int16_t[256].
 // w16[k] = round(d * sc * q2 - dmin * sc), clamped to [-32768, 32767].
+// AVX-512 vectorized: scalar 2-bit extraction + SIMD float arithmetic.
 void ds4_xeon_dequant_q2k_block_to_i16(
     int16_t *dst_i16, const ds4_xeon_block_q2_K *x)
 {
@@ -1138,21 +1139,40 @@ void ds4_xeon_dequant_q2k_block_to_i16(
     const float dmin = xeon_f16_to_f32(x->dmin);
     const uint8_t *sc = x->scales;
     const uint8_t *qs = x->qs;
+    const __m512 v32767 = _mm512_set1_ps(32767.0f);
+    const __m512 vm32768 = _mm512_set1_ps(-32768.0f);
 
     for (int j = 0; j < 16; j++) {
-        float sc_val = d * (float)sc[j];
-        float m_val  = dmin * (float)sc[j];
+        const float sc_val = d * (float)sc[j];
+        const float m_val  = dmin * (float)sc[j];
+        const __m512 v_sc = _mm512_set1_ps(sc_val);
+        const __m512 v_m  = _mm512_set1_ps(m_val);
         const uint8_t *q_ptr = qs + j * 4;
         int16_t *out = dst_i16 + j * 16;
 
+        // Scalar 2-bit extraction: 4 bytes → 16 values (fast, just bit ops)
+        int16_t q2_vals[16];
         for (int k = 0; k < 16; k++) {
-            uint8_t q_byte = q_ptr[k / 4];
-            uint8_t q2 = (q_byte >> ((k % 4) * 2)) & 3;
-            float wf = sc_val * (float)q2 - m_val;
-            if (wf > 32767.0f) wf = 32767.0f;
-            if (wf < -32768.0f) wf = -32768.0f;
-            out[k] = (int16_t)lrintf(wf);
+            q2_vals[k] = (int16_t)((q_ptr[k / 4] >> ((k % 4) * 2)) & 3);
         }
+
+        // AVX-512 float arithmetic on 16 elements
+        __m256i q16 = _mm256_loadu_si256((const __m256i*)q2_vals);
+        __m512i q32 = _mm512_cvtepi16_epi32(q16);
+        __m512 qf   = _mm512_cvtepi32_ps(q32);
+
+        // wf = sc * q2 - m
+        __m512 wf = _mm512_fmsub_ps(v_sc, qf, v_m);
+
+        // Clamp to int16 range
+        wf = _mm512_min_ps(_mm512_max_ps(wf, vm32768), v32767);
+
+        // Round and pack: float32 → int32 → int16
+        __m512i wi32 = _mm512_cvtps_epi32(
+            _mm512_roundscale_ps(wf, _MM_FROUND_TO_NEAREST_INT));
+        __m256i wi16 = _mm512_cvtsepi32_epi16(wi32);
+
+        _mm256_storeu_si256((__m256i*)out, wi16);
     }
 }
 
