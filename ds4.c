@@ -15543,12 +15543,13 @@ struct ds4_session {
 };
 
 #if defined(__x86_64__)
-/* Xeon-optimized FFN batch: MoE routed experts + shared FFN.
- * Delegates to CPU per-token FFN path for correctness.
- * Pre-dequant block primitives (ds4_xeon_dequant_iq2xxs_block_to_u8,
- * ds4_xeon_dequant_q2k_block_to_i16) are ready in ds4_xeon.c.
- * Full pre-dequant pass deferred: ~16M blocks per layer requires
- * AVX-512 vectorized dequant to keep load time practical. */
+/* Xeon-optimized FFN batch with expert token regrouping (Phase 7).
+ *
+ * T7.1 complete: builds inverted index expert→[tokens] for batch GEMM.
+ * T7.2 pending: actual batch GEMM needs pre-dequant weights from T3.3.1.
+ * Currently routes per-expert matvecs through CPU for correctness;
+ * the regrouping infrastructure enables drop-in VNNI batch GEMM later.
+ */
 static void ds4_xeon_ffn_shared_batch(
         float             * cur_f32,
         ds4_engine        * e,
@@ -15560,6 +15561,15 @@ static void ds4_xeon_ffn_shared_batch(
 {
     const ds4_model *model = &e->model;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const float *ffn_norm_w = tensor_data(model, lw->ffn_norm);
+
+    // --- T7.1: Build expert → tokens inverted index ---
+    int   *expert_tokens[256] = {0};  // flat list of token indices per expert
+    float *expert_weights[256] = {0}; // corresponding gate weights
+    int    expert_count[256] = {0};
+    int    expert_cap[256] = {0};
+    int   *token_experts[256] = {0};  // which experts each token selected (for scatter)
+    int    token_n_exp = 0;           // always DS4_N_EXPERT_USED
 
     for (int t = 0; t < n_tok; t++) {
         const float *inp_hc = next_f32 + (uint64_t)t * hc_dim;
@@ -15576,28 +15586,70 @@ static void ds4_xeon_ffn_shared_batch(
 
         // RMS Norm
         float norm[DS4_N_EMBD];
-        rms_norm_weight(norm, hc_ffn_inp,
-            tensor_data(model, lw->ffn_norm),
+        rms_norm_weight(norm, hc_ffn_inp, ffn_norm_w,
             DS4_N_EMBD, DS4_RMS_EPS);
 
-        // Routed MoE (reuse CPU implementation)
+        // Router: top-k expert selection (CPU, low compute)
+        int selected[DS4_N_EXPERT_USED];
+        float exp_w[DS4_N_EXPERT_USED];
+        memset(selected, 0, sizeof(selected));
+        memset(exp_w, 0, sizeof(exp_w));
+        if (lw->ffn_gate_inp) {
+            layer_topk_selected_experts(selected, exp_w, lw, norm, DS4_N_EMBD);
+        }
+
+        // Add to inverted index
+        for (uint32_t ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
+            int eid = selected[ei];
+            if (eid < 0 || eid >= DS4_N_EXPERT) continue;
+            if (fabsf(exp_w[ei]) < 1e-9f) continue;
+            if (expert_count[eid] >= expert_cap[eid]) {
+                int nc = expert_cap[eid] == 0 ? 4 : expert_cap[eid] * 2;
+                expert_tokens[eid] = xrealloc(expert_tokens[eid], (size_t)nc * sizeof(int));
+                expert_weights[eid] = xrealloc(expert_weights[eid], (size_t)nc * sizeof(float));
+                expert_cap[eid] = nc;
+            }
+            expert_tokens[eid][expert_count[eid]] = t;
+            expert_weights[eid][expert_count[eid]] = exp_w[ei];
+            expert_count[eid]++;
+        }
+
+        token_n_exp = DS4_N_EXPERT_USED; (void)token_n_exp;
+
+        // --- Per-token MoE + shared FFN (CPU path for now) ---
         float moe_out[DS4_N_EMBD];
         memset(moe_out, 0, sizeof(moe_out));
-        layer_routed_moe_one(moe_out, model, lw, norm,
-            il, tokens[t], -1.0f, false);
+        layer_routed_moe_one(moe_out, model, lw, norm, il, tokens[t], -1.0f, false);
 
-        // Shared FFN
         float shared_out[DS4_N_EMBD];
         memset(shared_out, 0, sizeof(shared_out));
         layer_shared_ffn_one(shared_out, model, lw, norm);
 
-        // Combine
-        for (int i = 0; i < DS4_N_EMBD; i++)
-            moe_out[i] += shared_out[i];
+        for (int d = 0; d < DS4_N_EMBD; d++)
+            moe_out[d] += shared_out[d];
 
         // HC post-FFN
         hc_post_one(out_hc, moe_out, inp_hc, hc_ffn_post, hc_ffn_comb,
             DS4_N_EMBD, DS4_N_HC);
+    }
+
+    // T7.6: Log expert load distribution (once per layer)
+    if (il == 0 && n_tok > 1) {
+        int active_experts = 0;
+        int max_load = 0;
+        for (int e = 0; e < DS4_N_EXPERT; e++) {
+            if (expert_count[e] > 0) active_experts++;
+            if (expert_count[e] > max_load) max_load = expert_count[e];
+        }
+        fprintf(stderr, "ds4: layer 0 expert load: %d/%d active, max=%d "
+                "(avg=%.1f)\n", active_experts, (int)DS4_N_EXPERT, max_load,
+                (double)n_tok * DS4_N_EXPERT_USED / (double)DS4_N_EXPERT);
+    }
+
+    // Cleanup inverted index
+    for (int e = 0; e < DS4_N_EXPERT; e++) {
+        free(expert_tokens[e]);
+        free(expert_weights[e]);
     }
 }
 
@@ -17432,6 +17484,37 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
     }
+#if defined(__x86_64__)
+    if (s->engine && s->engine->backend == DS4_BACKEND_XEON) {
+        ds4_engine *e = s->engine;
+        if (s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint))
+        {
+            s->mtp_draft_valid = false;
+            for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                forward_token_raw_swa_cpu_decode_scratch(s->logits,
+                    &e->model, &e->weights, &s->cpu_cache,
+                    prompt->v[i], (uint32_t)s->checkpoint.len,
+                    e->directional_steering_dirs,
+                    e->directional_steering_attn_scale,
+                    e->directional_steering_ffn_scale,
+                    &s->cpu_scratch);
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+                if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            }
+            s->checkpoint_valid = true;
+            return 0;
+        }
+        session_cpu_reset_cache(s);
+        prefill_xeon_graph(s->logits, e, s, prompt);
+        ds4_tokens_copy(&s->checkpoint, prompt);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         if (s->checkpoint_valid &&

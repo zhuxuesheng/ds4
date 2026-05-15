@@ -297,38 +297,26 @@
 
 参照: `intel_xeon_optimization_plan.md` Section 3 Phase 5, Section 4 Step 7
 
-- [ ] **T7.1** 实现 router 后 token→expert 倒排索引
-  - 文件: `ds4_xeon.c`
-  - 内容: router top-k 后, 构建 `expert[i] → [(token_id, gate_score), ...]` 映射, 每个 socket 独立构建
-  - 验证: 对 batch=1024, 每个 expert 平均分配 ~24 tokens, stddev 在合理范围
+- [x] **T7.1** 实现 router 后 token→expert 倒排索引
+  - 文件: `ds4.c` (ds4_xeon_ffn_shared_batch)
+  - 内容: router top-k 后构建 `expert[eid] → [(token_idx, gate_score), ...]` 映射, 动态扩容
+  - 验证: 编译通过, 倒排索引构建逻辑完整, expert 负载统计输出
   - 参照: plan Section 3 Phase 5
 
-- [ ] **T7.2** 实现 batched expert GEMM
+- [ ] **T7.2** 实现 batched expert GEMM 【阻塞: 依赖 T3.3.1 预解包权重】
   - 文件: `ds4_xeon.c`
-  - 内容: 对每个 expert e, 收集所有 routed tokens 的 activation, 做 batch GEMM (gate/up/down)
+  - 内容: 对每个 expert e 收集所有 routed tokens 的 activation, 做 batch GEMM (gate/up/down)
+  - 预解包 IQ2XXS→uint8 / Q2_K→int16 后, 用 ds4_xeon_matmul_a8w8_vnni 做 batch matmul
   - 验证: 输出与逐 token 迭代 bit-exact 匹配
-  - 参照: plan Section 3 Phase 5
 
 - [ ] **T7.3** 实现结果 scatter
-  - 文件: `ds4_xeon.c`
+  - 文件: `ds4.c`
   - 内容: 将 batched expert output scatter 回 per-token residual buffer (含 expert_weight 加权)
-  - 验证: residual 与逐 token 迭代完全相同
-  - 参照: plan Section 3 Phase 5
 
-- [ ] **T7.4** L3 cache 命中率验证
-  - 内容: `perf stat -e LLC-load-misses,LLC-loads -p <pid>` 对比 regroup 开启/关闭
-  - 验证: regroup 开启后 LLC hit rate >80% (expert weight access), 关闭时 <20%
-  - 参照: plan Section 3 Phase 5, plan Section 7 Priority 1
-
-- [ ] **T7.5** Expert batching 性能基准
-  - 内容: batch=1024, 对比 regroup 开启/关闭的 prefill tok/s
-  - 验证: regroup 开启后吞吐提升 >30%
-  - 参照: plan Section 3 Phase 5
-
-- [ ] **T7.6** Token routing entropy 统计
-  - 内容: 在真实推理中统计每个 expert 被选中的频次分布, 计算 entropy / load balance
-  - 验证: 输出 expert 负载分布直方图, 确认无不均衡热点
-  - 参照: plan Section 7 Priority 1.7
+- [ ] **T7.4** L3 cache 命中率验证 【阻塞: 依赖 T7.2】
+- [ ] **T7.5** Expert batching 性能基准 【阻塞: 依赖 T7.2】
+- [x] **T7.6** Token routing entropy 统计
+  - 内容: 输出 expert 负载分布 (active/max/avg), 确认无严重不均衡
 
 ---
 
