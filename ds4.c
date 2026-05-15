@@ -15805,6 +15805,53 @@ static void ds4_xeon_ffn_shared_batch(
     (void)tokens;
 }
 
+// Convert a Q8_0 tensor to uint8 weights + per-row scales for VNNI matmul.
+// Q8_0 blocks: fp16 d + 32 int8. Output: [out_dim][in_dim] uint8 row-major.
+// d scale is baked into uint8 values; w_scale set to 1.0 per row.
+// Returns allocated w8 buffer (caller frees), fills w_scale array.
+static uint8_t *ds4_xeon_q80_to_matmul(
+        const ds4_model *model, const ds4_tensor *t,
+        float **w_scale_out, uint64_t *out_dim_out, uint64_t *in_dim_out)
+{
+    if (!t || t->ndim != 2) return NULL;
+    uint64_t in_dim  = t->dim[0];   // input features
+    uint64_t out_dim = t->dim[1];   // output features
+    if (t->type != DS4_TENSOR_Q8_0) return NULL;
+
+    const uint64_t n_blocks_per_row = (in_dim + 31) / 32;
+    const uint8_t *data = tensor_data(model, t);
+    uint8_t  *w8 = xmalloc((size_t)out_dim * in_dim);
+    float    *ws = xmalloc((size_t)out_dim * sizeof(float));
+
+    for (uint64_t r = 0; r < out_dim; r++) {
+        const uint8_t *row = data + r * n_blocks_per_row * 34;
+        uint8_t *dst = w8 + r * in_dim;
+        float row_scale_sum = 0.0f;
+
+        for (uint64_t b = 0; b < n_blocks_per_row; b++) {
+            const uint8_t *block = row + b * 34;
+            float d;
+            uint16_t d16;
+            memcpy(&d16, block, 2);
+            { uint32_t u = (uint32_t)d16 << 16; memcpy(&d, &u, 4); }
+            row_scale_sum += d;
+            const int8_t *qs = (const int8_t*)(block + 2);
+            for (int i = 0; i < 32; i++) {
+                float wf = d * (float)qs[i];
+                if (wf > 127.0f) wf = 127.0f;
+                if (wf < -128.0f) wf = -128.0f;
+                dst[b * 32 + i] = (uint8_t)((int16_t)lrintf(wf) + 128);
+            }
+        }
+        ws[r] = 1.0f;  // d baked into values, scale = 1.0
+    }
+
+    *w_scale_out = ws;
+    *out_dim_out = out_dim;
+    *in_dim_out  = in_dim;
+    return w8;
+}
+
 /* High-performance Xeon prefill using the static graph and VNNI math. */
 static void prefill_xeon_graph(
         float             * logits,
@@ -15831,7 +15878,7 @@ static void prefill_xeon_graph(
 
         const ds4_layer_weights *lw = &e->weights.layer[il];
 
-        // 1. Attention (FP32)
+        // 1. Attention (CPU path — VNNI optimization WIP, see Phase 5.5)
         layer_attention_raw_swa_batch(next_f32,
                                       &e->model,
                                       lw,

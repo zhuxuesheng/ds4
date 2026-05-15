@@ -264,6 +264,46 @@
 
 ---
 
+## Phase 5.5: Attention VNNI Optimization
+
+参照: `intel_xeon_optimization_plan.md` Section 3 Phase 2
+
+Attention weights are Q8_0 format (already int8), ready for VPDPBUSD without pre-dequant.
+Per-layer compute: ~4-5B MACs (Q+KV+Output projections + attention scores).
+With VPDPBUSD at ~10 TOPS effective, target <0.5ms per layer for batch=10.
+
+### 5.5.1 Q/KV/Output 投影
+
+- [ ] **T5.5.1** 实现 `ds4_xeon_attn_q_proj` — Q 投影 (LoRA: q_a down + q_b up)
+  - 文件: `ds4.c` (access attn_q_a / attn_q_b tensors)
+  - 内容: Q8_0 weight → ds4_xeon_matmul_a8w8_vnni_batch (VPDPBUSD)
+  - 验证: 输出与 CPU 路径 bit-exact 匹配
+
+- [ ] **T5.5.2** 实现 `ds4_xeon_attn_kv_proj` — KV 投影
+  - 文件: `ds4.c`
+  - 内容: Q8_0 weight → VPDPBUSD batch matmul
+  - 验证: 输出与 CPU 路径 bit-exact 匹配
+
+- [ ] **T5.5.3** 实现 `ds4_xeon_attn_output_proj` — Output 投影 (grouped LoRA)
+  - 文件: `ds4.c`
+  - 内容: Q8_0 weight → VPDPBUSD batch matmul
+  - 验证: 输出与 CPU 路径 bit-exact 匹配
+
+### 5.5.2 Attention Scores
+
+- [ ] **T5.5.4** 实现 `ds4_xeon_attn_scores` — QK^T + softmax + weighted sum
+  - 文件: `ds4_xeon.c`
+  - 内容: AVX-512 Flash-Attention: Q[heads][512] × K^T[512][seq] → softmax → × V[seq][512]
+  - 验证: 输出与 CPU 路径逐元素误差 <1e-4
+
+### 5.5.3 集成
+
+- [ ] **T5.5.5** 替换 `prefill_xeon_graph` 中的 `layer_attention_raw_swa_batch` 调用
+  - 内容: 用 xeon attention kernel 替换 CPU attention batch
+  - 验证: prefill 总时间从 ~2s/layer 降到 <0.5s/layer
+
+---
+
 ## Phase 6: KV Cache & Long-Context Optimization
 
 参照: `intel_xeon_optimization_plan.md` Section 4, Step 6
