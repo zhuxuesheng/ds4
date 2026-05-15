@@ -15735,10 +15735,7 @@ static void ds4_xeon_ffn_shared_batch(
             w_up, NULL, ne, (int)DS4_N_EMBD, (int)DS4_N_FF_EXP);
 
         float *mid_f32 = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(float));
-        for (int i = 0; i < ne * (int)DS4_N_FF_EXP; i++) {
-            float g = gate_out[i];
-            mid_f32[i] = (g / (1.0f + expf(-g))) * up_out[i];
-        }
+        ds4_xeon_swiglu(mid_f32, gate_out, up_out, ne * (int)DS4_N_FF_EXP);
 
         int16_t *mid_i16 = xmalloc((size_t)ne * DS4_N_FF_EXP * sizeof(int16_t));
         float *mid_scale = xmalloc((size_t)ne * sizeof(float));
@@ -15751,14 +15748,12 @@ static void ds4_xeon_ffn_shared_batch(
         ds4_xeon_matmul_a16w16_vnni_batch(down_out, mid_i16, mid_scale,
             w_down, NULL, ne, (int)DS4_N_FF_EXP, (int)DS4_N_EMBD);
 
-        // T7.3: Scatter
+        // T7.3: Scatter (vectorized axpy)
         for (int i = 0; i < ne; i++) {
             int t = h_sel[eid][i];
-            float ew = h_ew[eid][i];
-            float *moe_t = h_moe + (uint64_t)t * DS4_N_EMBD;
-            float *down_i = down_out + (uint64_t)i * DS4_N_EMBD;
-            for (uint32_t d = 0; d < DS4_N_EMBD; d++)
-                moe_t[d] += ew * down_i[d];
+            ds4_xeon_axpy_f32(h_moe + (uint64_t)t * DS4_N_EMBD,
+                down_out + (uint64_t)i * DS4_N_EMBD,
+                h_ew[eid][i], (int)DS4_N_EMBD);
         }
 
         free(act_f32); free(act_i8); free(act_scale);

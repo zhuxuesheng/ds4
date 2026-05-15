@@ -1010,6 +1010,20 @@ void ds4_xeon_attn_scores(
 }
 
 // ============================================================================
+// Vectorized axpy: y[i] += a * x[i]  (n elements, AVX-512)
+// ============================================================================
+void ds4_xeon_axpy_f32(float *y, const float *x, float a, int n) {
+    __m512 va = _mm512_set1_ps(a);
+    int i;
+    for (i = 0; i <= n - 16; i += 16) {
+        __m512 vy = _mm512_loadu_ps(y + i);
+        __m512 vx = _mm512_loadu_ps(x + i);
+        _mm512_storeu_ps(y + i, _mm512_add_ps(vy, _mm512_mul_ps(va, vx)));
+    }
+    for (; i < n; i++) y[i] += a * x[i];
+}
+
+// ============================================================================
 // SwiGLU (AVX-512 with scalar sigmoid)
 // ============================================================================
 
@@ -1086,6 +1100,9 @@ void ds4_xeon_dequant_q2k_block_to_i16(int16_t *d, const void *x) {
 }
 void ds4_xeon_attn_scores(float *h, const float *q, const float *kv, uint32_t n, uint32_t il) {
     (void)h; (void)q; (void)kv; (void)n; (void)il;
+}
+void ds4_xeon_axpy_f32(float *y, const float *x, float a, int n) {
+    for (int i = 0; i < n; i++) y[i] += a * x[i];
 }
 #endif
 
