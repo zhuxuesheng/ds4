@@ -225,8 +225,9 @@ static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
+    if (!strcmp(s, "xeon")) return DS4_BACKEND_XEON;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
-    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu, xeon\n");
     exit(2);
 }
 

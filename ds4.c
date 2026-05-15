@@ -74,7 +74,7 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
+    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA || backend == DS4_BACKEND_XEON;
 }
 
 /* =========================================================================
@@ -225,7 +225,7 @@ static const uint8_t kmask_iq2xs[8] = {
     1, 2, 4, 8, 16, 32, 64, 128
 };
 
-static const uint8_t ksigns_iq2xs[128] = {
+const uint8_t ksigns_iq2xs[128] = {
       0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
     144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
     160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
@@ -236,7 +236,7 @@ static const uint8_t ksigns_iq2xs[128] = {
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
-static const uint64_t iq2xxs_grid[256] = {
+const uint64_t iq2xxs_grid[256] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
     0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
@@ -15140,12 +15140,24 @@ static int generate_raw_swa_cpu(
         void              * progress_ud) {
     (void)progress;
     (void)progress_ud;
+
+    // Search for existing session or create a temporary one
+    // Actually, this function is used by the CLI for one-off runs.
+    // For xeon, we should probably use the same logic but call our prefill.
+    
     fprintf(stderr, "ds4: using CPU generation with layer-major prefill\n");
 
     ds4_kv_cache cache;
     kv_cache_init(&cache, (uint32_t)ctx_size, 0);
     ds4_cpu_decode_scratch decode_scratch;
     cpu_decode_scratch_init(&decode_scratch, (uint32_t)ctx_size);
+
+    // If backend is XEON, we need a graph. 
+    // This function is tricky because it doesn't take a ds4_engine* or ds4_session*.
+    // It's a static helper.
+    
+    // Wait, I should check the caller of generate_raw_swa_cpu.
+    // It's ds4_engine_generate_argmax.
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     int pos = prompt->len;
@@ -15530,12 +15542,132 @@ struct ds4_session {
     bool mtp_draft_valid;
 };
 
-/* =========================================================================
- * Session Snapshot Payloads.
- * =========================================================================
- *
- * The server disk cache stores a high-level file header, then delegates the
- * graph-specific payload below to the engine.  This payload is intentionally
+#if defined(__x86_64__)
+/* High-performance Xeon prefill using the static graph and VNNI math. */
+static void prefill_xeon_graph(
+        float             * logits,
+        ds4_engine        * e,
+        ds4_session       * s,
+        const token_vec   * prompt) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t n_tok = (uint64_t)prompt->len;
+    ds4_xeon_graph *g = &s->xeon_graph;
+    
+    // Initial embedding
+    float *cur_f32 = g->f32_cur;
+    float *next_f32 = g->f32_next;
+    float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
+    for (uint64_t t = 0; t < n_tok; t++) {
+        embed_token_f16(&e->model, &e->weights, prompt->v[t], plain);
+        hc_from_plain_embedding(cur_f32 + t * hc_dim, plain, DS4_N_EMBD, DS4_N_HC);
+    }
+    free(plain);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        fprintf(stderr, "ds4: xeon prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
+        fflush(stderr);
+
+        const ds4_layer_weights *lw = &e->weights.layer[il];
+
+        // 1. Attention (FP32)
+        layer_attention_raw_swa_batch(next_f32,
+                                      &e->model,
+                                      lw,
+                                      &s->cpu_cache.layer[il],
+                                      cur_f32,
+                                      (uint32_t)n_tok,
+                                      il,
+                                      0,
+                                      e->directional_steering_dirs,
+                                      e->directional_steering_attn_scale);
+
+        // 2. FFN (Xeon High-Performance Path)
+        ds4_xeon_ffn_shared_batch(cur_f32,
+                                  e,
+                                  lw,
+                                  next_f32,
+                                  prompt->v,
+                                  (int)n_tok,
+                                  (int)il);
+    }
+
+    kv_cache_finish_prefill_states(&s->cpu_cache, (uint32_t)n_tok);
+    if (logits) {
+        output_logits_one(logits, &e->model, &e->weights, cur_f32 + (n_tok - 1) * hc_dim);
+    }
+}
+
+/* Xeon version of the high-level generation loop. */
+static int generate_xeon_graph_raw_swa(
+        const ds4_model   * model,
+        const ds4_vocab   * vocab,
+        const ds4_weights * weights,
+        const token_vec   * prompt,
+        int                 n_predict,
+        int                 ctx_size,
+        bool                quality,
+        const char        * steering_file,
+        float               steering_attn,
+        float               steering_ffn,
+        ds4_token_emit_fn   emit,
+        ds4_generation_done_fn done,
+        void              * emit_ud,
+        ds4_session_progress_fn progress,
+        void              * progress_ud) {
+    (void)quality; (void)steering_file; (void)steering_attn; (void)steering_ffn;
+    
+    ds4_engine *temp_e = xcalloc(1, sizeof(*temp_e));
+    temp_e->backend = DS4_BACKEND_XEON;
+    temp_e->model = *model;
+    temp_e->weights = *weights;
+    temp_e->vocab = *vocab;
+
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, temp_e, ctx_size) != 0) {
+        free(temp_e);
+        return 1;
+    }
+    s->progress = progress;
+    s->progress_ud = progress_ud;
+
+    fprintf(stderr, "ds4: using Xeon optimized VNNI graph engine\n");
+    
+    prefill_xeon_graph(s->logits, temp_e, s, prompt);
+    ds4_tokens_copy(&s->checkpoint, prompt);
+    s->checkpoint_valid = true;
+
+    int token = sample_argmax(s->logits, DS4_N_VOCAB);
+    if (emit) emit(emit_ud, token);
+
+    for (int i = 0; i < n_predict - 1; i++) {
+        ds4_tokens next_prompt = {0};
+        ds4_tokens_copy(&next_prompt, &s->checkpoint);
+        ds4_tokens_push(&next_prompt, token);
+        
+        char err[256];
+        if (ds4_session_sync(s, &next_prompt, err, sizeof(err)) != 0) {
+            ds4_tokens_free(&next_prompt);
+            break;
+        }
+        
+        token = sample_argmax(s->logits, DS4_N_VOCAB);
+        if (emit) emit(emit_ud, token);
+        if (token == vocab->eos_id) {
+            ds4_tokens_free(&next_prompt);
+            break;
+        }
+        
+        ds4_tokens_free(&next_prompt);
+    }
+
+    if (done) done(emit_ud);
+    ds4_session_free(s);
+    free(temp_e);
+    return 0;
+}
+#endif
+
+/*
  * not mmaped: restoring a checkpoint copies bytes back into the already
  * allocated Metal tensors, preserving the same live graph buffers used by
  * normal prefill/decode.  The raw SWA cache is serialized as the last logical
@@ -16743,6 +16875,21 @@ int ds4_engine_generate_argmax(
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
 
+    if (e->backend == DS4_BACKEND_XEON) {
+#if defined(__x86_64__)
+        return generate_xeon_graph_raw_swa(model, vocab, weights, prompt,
+                                            n_predict, ctx_size, e->quality,
+                                            e->directional_steering_file,
+                                            e->directional_steering_attn_scale,
+                                            e->directional_steering_ffn_scale,
+                                            emit, done, emit_ud,
+                                            progress, progress_ud);
+#else
+        fprintf(stderr, "ds4: Xeon backend requested but not supported on this architecture\n");
+        return 1;
+#endif
+    }
+
     if (ds4_backend_uses_graph(e->backend)) {
 #ifndef DS4_NO_GPU
         if (!e->metal_ready) {
@@ -17069,7 +17216,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 ds4_backend_name(e->backend));
     }
 #else
-    if (graph_backend) {
+    if (graph_backend && e->backend != DS4_BACKEND_XEON) {
         fprintf(stderr, "ds4: %s backend requested but this build has no graph backend support; aborting startup\n",
                 ds4_backend_name(e->backend));
         ds4_engine_close(e);

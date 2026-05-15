@@ -10,7 +10,7 @@ endif
 CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 
-LDLIBS ?= -lm -pthread
+LDLIBS ?= -lm -pthread -fopenmp
 METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
@@ -27,8 +27,8 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_cuda.o ds4_xeon.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_xeon.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -139,6 +139,9 @@ ds4_server_cpu.o: ds4_server.c ds4.h rax.h
 
 ds4_bench_cpu.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
+
+ds4_xeon.o: ds4_xeon.c ds4_xeon.h
+	$(CC) $(CFLAGS) -fopenmp -c -o $@ ds4_xeon.c
 
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
