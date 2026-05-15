@@ -141,7 +141,7 @@ ds4_bench_cpu.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
 ds4_xeon.o: ds4_xeon.c ds4_xeon.h
-	$(CC) $(CFLAGS) -fopenmp -c -o $@ ds4_xeon.c
+	$(CC) $(CFLAGS) -mprefer-vector-width=512 -fopenmp -c -o $@ ds4_xeon.c
 
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
@@ -163,7 +163,7 @@ test: ds4_test
 	./ds4_test
 
 xeon-bench:
-	$(CC) $(CFLAGS) -fopenmp -o tests/ds4_xeon_matmul_bench tests/ds4_xeon_matmul_bench.c $(LDLIBS)
+	$(CC) $(CFLAGS) -mprefer-vector-width=512 -fopenmp -o tests/ds4_xeon_matmul_bench tests/ds4_xeon_matmul_bench.c -lm
 	./tests/ds4_xeon_matmul_bench
 
 xeon-math-test:

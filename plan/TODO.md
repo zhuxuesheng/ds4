@@ -11,42 +11,42 @@
 
 ### 1.1 创建后端隔离层
 
-- [ ] **T1.1.1** 添加 `DS4_BACKEND_XEON` 到 `ds4_backend` 枚举
+- [x] **T1.1.1** 添加 `DS4_BACKEND_XEON` 到 `ds4_backend` 枚举
   - 文件: `ds4.h`
   - 验证: `grep DS4_BACKEND_XEON ds4.h` 返回新增枚举值
   - 参照: plan Section 4, Step 1.1
 
-- [ ] **T1.1.2** 创建 `ds4_xeon.h` 头文件（若不存在则新建，若存在则审查）
+- [x] **T1.1.2** 创建 `ds4_xeon.h` 头文件（若不存在则新建，若存在则审查）
   - 内容: 类型定义 (`ds4_xeon_block_q4_K`, `ds4_xeon_graph`, `ds4_xeon_model_context`), 函数声明
   - 验证: 与 `ds4_xeon.c` 编译无缺失声明
   - 参照: plan Section 5 (Plugin Graph Model), 现有 `ds4_xeon.h`
 
-- [ ] **T1.1.3** 审查 `ds4_xeon.c` 现有实现
+- [x] **T1.1.3** 审查 `ds4_xeon.c` 现有实现
   - 内容: 确认现有 kernel 位置 (`ds4_xeon_vec_dot_q4_K_vnni_8row`, `ds4_xeon_rms_norm`, `ds4_xeon_swiglu`, `ds4_xeon_quantize_a16`), 标记需重写/新增的函数
   - 验证: 输出函数清单，标注每个函数的状态 (keep / rewrite / new)
   - 参照: plan Section 3 Phase 2-3
 
 ### 1.2 VPDPBUSD (INT8 VNNI) 微基准
 
-- [ ] **T1.2.1** 编写 `matmul_w4a8_vnni` 纯 INT8 VNNI kernel
+- [x] **T1.2.1** 编写 `matmul_w4a8_vnni` 纯 INT8 VNNI kernel
   - 文件: `ds4_xeon.c`
   - 内容: `_mm512_dpbusd_epi32` intrinsics, INT8 activation × uint8 weight → INT32 accumulator
   - 验证: 编译通过, `objdump -d` 确认包含 `vpdpbusd` 指令
   - 参照: plan Section 2.2 (VPDPBUSD 12.9 TOPS theoretical)
 
-- [ ] **T1.2.2** 更新 `tests/ds4_xeon_matmul_bench.c` 增加 INT8 VNNI 测试
+- [x] **T1.2.2** 更新 `tests/ds4_xeon_matmul_bench.c` 增加 INT8 VNNI 测试
   - 内容: N=K=4096, INT8 activations, uint8 weights, 测 VPDPBUSD 吞吐
   - 验证: 输出 `>9 TOPS` (70% of 12.9 TOPS), 编译需 `-march=native -mprefer-vector-width=512`
   - 参照: plan Section 4 Step 1.3
 
-- [ ] **T1.2.3** 更新 Makefile `xeon-bench` target
+- [x] **T1.2.3** 更新 Makefile `xeon-bench` target
   - 内容: 加入 `-mprefer-vector-width=512` 编译选项
   - 验证: `make xeon-bench` 成功编译并运行, 输出 INT8 + INT16 两项吞吐数据
   - 参照: plan Section 4 Step 1.3
 
 ### 1.3 VPDPWSSD (INT16 VNNI) 微基准
 
-- [ ] **T1.3.1** 审查并优化已有 `matmul_w4a16_vnni` kernel
+- [x] **T1.3.1** 审查并优化已有 `matmul_w4a16_vnni` kernel
   - 文件: `ds4_xeon.c` (现有 `bench_vnni_multi_thread` 逻辑迁移为正式 kernel)
   - 优化点: reduction 移出 inner loop, 检查 8-way unroll 是否足够隐藏延迟
   - 验证: 吞吐 ≥4.5 TOPS (70% of 6.4 TOPS)
