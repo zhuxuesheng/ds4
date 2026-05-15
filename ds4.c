@@ -15897,12 +15897,18 @@ static void ds4_xeon_matmul_q8_0_batch(
 // VNNI-accelerated attention batch for prefill (Phase 5.5).
 // Replaces layer_attention_raw_swa_batch with VNNI Q/KV/Output projections.
 // Attention scores and HC still use CPU path (low compute intensity).
-static void ds4_xeon_attention_batch(
+static bool ds4_xeon_attention_batch(
         float *after_attn_hc, const ds4_model *model,
         const ds4_layer_weights *layer, ds4_layer_cache *cache,
         const float *inp_hc, uint32_t n_tok, uint32_t il,
         const float *steering_dirs, float steering_scale)
 {
+    (void)after_attn_hc; (void)model; (void)layer; (void)cache;
+    (void)inp_hc; (void)n_tok; (void)il;
+    (void)steering_dirs; (void)steering_scale;
+    return false;  // WIP: use CPU attention until AVX-512 kernel debugged
+#if 0   // --- VNNI attention (kept for reference, needs AVX-512 in ds4.c) ---
+    if (!layer->attn_q_a || !layer->attn_q_b || !layer->attn_kv) return false;
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
     const uint64_t q_dim  = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -15917,35 +15923,68 @@ static void ds4_xeon_attention_batch(
         layer->hc_attn_base, layer->attn_norm, inp_hc, attn_residual,
         attn_cur, attn_norm, post, comb, n_tok);
 
-    // --- Q projection (VNNI) ---
+    // --- Pre-convert attention Q8_0 weights (once per layer) ---
+    float *wqa_s, *wqb_s, *wkv_s;
+    uint64_t wq_od, wq_id, wkv_od, wkv_id;
+    uint8_t *wq_a  = ds4_xeon_q80_to_matmul(model, layer->attn_q_a, &wqa_s, &wq_od, &wq_id);
+    uint8_t *wq_b  = ds4_xeon_q80_to_matmul(model, layer->attn_q_b, &wqb_s, &wq_od, &wq_id);
+    uint8_t *wkv_w = ds4_xeon_q80_to_matmul(model, layer->attn_kv, &wkv_s, &wkv_od, &wkv_id);
+
+    // --- Q projection (VNNI, cached weights) ---
     float *qr      = xmalloc((size_t)n_tok * DS4_N_LORA_Q * sizeof(float));
     float *qr_norm = xmalloc((size_t)n_tok * DS4_N_LORA_Q * sizeof(float));
     float *q       = xmalloc((size_t)n_tok * q_dim * sizeof(float));
     const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
 
-    ds4_xeon_matmul_q8_0_batch(qr, model, layer->attn_q_a, attn_norm, n_tok);
+    // Q down: quantize act → VNNI matmul with cached wq_a
+    {
+        int8_t *aq = xmalloc((size_t)n_tok * DS4_N_EMBD);
+        float *as  = xmalloc((size_t)n_tok * ((DS4_N_EMBD+63)/64) * sizeof(float));
+        ds4_xeon_quantize_a8_per_block(aq, as, attn_norm, (int)n_tok, DS4_N_EMBD, 64);
+        memset(qr, 0, (size_t)n_tok * DS4_N_LORA_Q * sizeof(float));
+        ds4_xeon_matmul_a8w8_vnni_batch(qr, aq, as, wq_a, wqa_s,
+            (int)n_tok, (int)DS4_N_EMBD, (int)DS4_N_LORA_Q);
+        free(aq); free(as);
+    }
     for (uint32_t t = 0; t < n_tok; t++) {
         rms_norm_weight(qr_norm + (uint64_t)t * DS4_N_LORA_Q,
             qr + (uint64_t)t * DS4_N_LORA_Q, q_a_norm,
             DS4_N_LORA_Q, DS4_RMS_EPS);
     }
-    ds4_xeon_matmul_q8_0_batch(q, model, layer->attn_q_b, qr_norm, n_tok);
+    // Q up: quantize qr_norm → VNNI matmul with cached wq_b
+    {
+        int8_t *aq = xmalloc((size_t)n_tok * DS4_N_LORA_Q);
+        float *as  = xmalloc((size_t)n_tok * ((DS4_N_LORA_Q+63)/64) * sizeof(float));
+        ds4_xeon_quantize_a8_per_block(aq, as, qr_norm, (int)n_tok, DS4_N_LORA_Q, 64);
+        memset(q, 0, (size_t)n_tok * q_dim * sizeof(float));
+        ds4_xeon_matmul_a8w8_vnni_batch(q, aq, as, wq_b, wqb_s,
+            (int)n_tok, (int)DS4_N_LORA_Q, (int)q_dim);
+        free(aq); free(as);
+    }
     for (uint32_t t = 0; t < n_tok; t++) {
         head_rms_norm_inplace(q + (uint64_t)t * q_dim,
             DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
     }
 
-    // --- KV projection (VNNI) ---
+    // --- KV projection (VNNI, cached weights) ---
     float *kv_raw = xmalloc((size_t)n_tok * DS4_N_HEAD_DIM * sizeof(float));
     float *kv     = xmalloc((size_t)n_tok * DS4_N_HEAD_DIM * sizeof(float));
     const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
-
-    ds4_xeon_matmul_q8_0_batch(kv_raw, model, layer->attn_kv, attn_norm, n_tok);
+    {
+        int8_t *ak = xmalloc((size_t)n_tok * DS4_N_EMBD);
+        float *as  = xmalloc((size_t)n_tok * ((DS4_N_EMBD+63)/64) * sizeof(float));
+        ds4_xeon_quantize_a8_per_block(ak, as, attn_norm, (int)n_tok, DS4_N_EMBD, 64);
+        memset(kv_raw, 0, (size_t)n_tok * DS4_N_HEAD_DIM * sizeof(float));
+        ds4_xeon_matmul_a8w8_vnni_batch(kv_raw, ak, as, wkv_w, wkv_s,
+            (int)n_tok, (int)DS4_N_EMBD, (int)DS4_N_HEAD_DIM);
+        free(ak); free(as);
+    }
     for (uint32_t t = 0; t < n_tok; t++) {
         rms_norm_weight(kv + (uint64_t)t * DS4_N_HEAD_DIM,
             kv_raw + (uint64_t)t * DS4_N_HEAD_DIM, kv_norm,
             DS4_N_HEAD_DIM, DS4_RMS_EPS);
     }
+    free(wkv_w); free(wkv_s);
 
     // --- RoPE + KV cache (CPU) ---
     float *heads = xmalloc((size_t)n_tok * q_dim * sizeof(float));
@@ -15961,58 +16000,22 @@ static void ds4_xeon_attention_batch(
         kv_cache_push_raw(cache, kv + (uint64_t)t * DS4_N_HEAD_DIM);
     }
 
-    // --- Attention scores: QK^T + softmax + weighted sum (CPU for now) ---
-    // Simplified: no compression/indexer. Uses raw SWA window.
-    uint32_t n_raw = cache->n_raw;
-    if (n_raw > n_tok) n_raw = n_tok;
-    const float attn_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    // --- Attention scores: QK^T + softmax + weighted sum ---
+    // Use AVX-512 kernel if available (ds4_xeon_attn_scores),
+    // otherwise fall back to simple scalar path
+#if defined(__AVX512F__)
+    ds4_xeon_attn_scores(heads, q, cache->raw_kv, n_tok, il);
 
-    // For each token, for each head, compute attention over raw rows
     for (uint32_t t = 0; t < n_tok; t++) {
-        const float *qt = q + (uint64_t)t * q_dim;
-        float *ht = heads + (uint64_t)t * q_dim;
-        uint32_t n_visible = t + 1;  // causal: token t sees rows 0..t
-
-        for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-            const float *qh = qt + (uint64_t)h * DS4_N_HEAD_DIM;
-            float *oh = ht + (uint64_t)h * DS4_N_HEAD_DIM;
-            memset(oh, 0, DS4_N_HEAD_DIM * sizeof(float));
-
-            // Simple dot-product attention over KV rows
-            float max_score = DS4_NEG_INF;
-            float *scores = xmalloc((size_t)n_visible * sizeof(float));
-            for (uint32_t vi = 0; vi < n_visible; vi++) {
-                const float *kv_row = cache->raw_kv + (uint64_t)vi * DS4_N_HEAD_DIM;
-                float dot = 0.0f;
-                for (uint32_t d = 0; d < DS4_N_HEAD_DIM; d++)
-                    dot += qh[d] * kv_row[d];
-                dot *= attn_scale;
-                scores[vi] = dot;
-                if (dot > max_score) max_score = dot;
-            }
-
-            // Softmax
-            float sum_exp = 0.0f;
-            for (uint32_t vi = 0; vi < n_visible; vi++) {
-                scores[vi] = expf(scores[vi] - max_score);
-                sum_exp += scores[vi];
-            }
-            float inv_sum = 1.0f / (sum_exp + 1e-10f);
-
-            // Weighted sum
-            for (uint32_t vi = 0; vi < n_visible; vi++) {
-                float w = scores[vi] * inv_sum;
-                const float *kv_row = cache->raw_kv + (uint64_t)vi * DS4_N_HEAD_DIM;
-                for (uint32_t d = 0; d < DS4_N_HEAD_DIM; d++)
-                    oh[d] += w * kv_row[d];
-            }
-            free(scores);
-        }
-
-        // Inverse RoPE on attention output
+        float *ht = heads + (uint64_t)t * DS4_N_HEAD * DS4_N_HEAD_DIM;
         rope_tail_layer_inplace(ht, DS4_N_HEAD, DS4_N_HEAD_DIM,
             DS4_N_ROT, (uint32_t)t, il, true);
     }
+#else
+    // Scalar fallback (ds4.c compiled without AVX-512)
+    (void)heads; (void)q; (void)cache; (void)n_tok; (void)il;
+    return false;  // signal caller to use CPU attention instead
+#endif
 
     // --- Output projection (VNNI) ---
     float *attn_out = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(float));
@@ -16028,7 +16031,10 @@ static void ds4_xeon_attention_batch(
     free(kv); free(kv_raw);
     free(q); free(qr_norm); free(qr);
     free(post); free(comb);
+    free(wq_a); free(wqa_s); free(wq_b); free(wqb_s);
     free(attn_norm); free(attn_cur); free(attn_residual);
+    return true;
+#endif
 }
 
 /* High-performance Xeon prefill using the static graph and VNNI math. */
@@ -16057,16 +16063,19 @@ static void prefill_xeon_graph(
 
         const ds4_layer_weights *lw = &e->weights.layer[il];
 
-        // 1. Attention (Phase 5.5: VNNI Q/KV/Output + CPU scores)
-        ds4_xeon_attention_batch(next_f32,
-                                 &e->model,
-                                 lw,
-                                 &s->cpu_cache.layer[il],
-                                 cur_f32,
-                                 (uint32_t)n_tok,
-                                 il,
+        // 1. Attention (xeon VNNI Q/KV + CPU scores)
+        // Try xeon attention, fallback to CPU on failure
+        if (!ds4_xeon_attention_batch(next_f32,
+                                 &e->model, lw, &s->cpu_cache.layer[il],
+                                 cur_f32, (uint32_t)n_tok, il,
                                  e->directional_steering_dirs,
-                                 e->directional_steering_attn_scale);
+                                 e->directional_steering_attn_scale)) {
+            layer_attention_raw_swa_batch(next_f32,
+                &e->model, lw, &s->cpu_cache.layer[il],
+                cur_f32, (uint32_t)n_tok, il, 0,
+                e->directional_steering_dirs,
+                e->directional_steering_attn_scale);
+        }
 
         // 2. FFN (Xeon High-Performance Path, Phase 7 batch GEMM)
         ds4_xeon_ffn_shared_batch(cur_f32,

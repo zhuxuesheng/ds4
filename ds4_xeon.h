@@ -171,6 +171,14 @@ void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
 void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs *x,
     const int16_t *y_i16, float scale_y);
 
+// === Attention ===
+
+// AVX-512 attention scores: QK^T + softmax + weighted sum (causal masking)
+// q: [n_tok][DS4_N_HEAD * DS4_N_HEAD_DIM], raw_kv: [n_raw][DS4_N_HEAD_DIM]
+// heads: [n_tok][DS4_N_HEAD * DS4_N_HEAD_DIM] output
+void ds4_xeon_attn_scores(float *heads, const float *q, const float *raw_kv,
+    uint32_t n_tok, uint32_t il);
+
 // === Activation Quantization ===
 
 // Per-block INT8 quantization (Q8_0 style): 32-element blocks, each with own scale

@@ -15,6 +15,9 @@
 #endif
 
 // Model dimension defaults (must match ds4.c constants)
+#ifndef DS4_NEG_INF
+#define DS4_NEG_INF (-1.0e30f)
+#endif
 #ifndef DS4_N_EMBD
 #define DS4_N_EMBD 4096
 #endif
@@ -26,6 +29,15 @@
 #endif
 #ifndef DS4_N_EXPERT_USED
 #define DS4_N_EXPERT_USED 6
+#endif
+#ifndef DS4_N_HEAD
+#define DS4_N_HEAD 64
+#endif
+#ifndef DS4_N_HEAD_DIM
+#define DS4_N_HEAD_DIM 512
+#endif
+#ifndef DS4_N_ROT
+#define DS4_N_ROT 64
 #endif
 
 // Tables defined in ds4.c (for IQ2XXS dequant)
@@ -930,6 +942,74 @@ void ds4_xeon_rms_norm(float *out, const float *in, const float *w, int n, float
 }
 
 // ============================================================================
+// Attention Scores (AVX-512) — QK^T + softmax + weighted sum
+// ============================================================================
+// Compute attention for n_tok tokens with causal masking.
+// q: [n_tok][DS4_N_HEAD * DS4_N_HEAD_DIM] query vectors
+// raw_kv: [n_raw][DS4_N_HEAD_DIM] key/value rows in KV cache
+// heads: [n_tok][DS4_N_HEAD * DS4_N_HEAD_DIM] output (overwritten)
+void ds4_xeon_attn_scores(
+    float *heads, const float *q, const float *raw_kv,
+    uint32_t n_tok, uint32_t il)
+{
+    (void)il;
+    const float attn_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    float *scores_buf = (float*)aligned_alloc(64, (size_t)n_tok * sizeof(float));
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *qt = q + (uint64_t)t * DS4_N_HEAD * DS4_N_HEAD_DIM;
+        float *ht = heads + (uint64_t)t * DS4_N_HEAD * DS4_N_HEAD_DIM;
+        uint32_t n_visible = t + 1;
+
+        for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
+            const float *qh = qt + (uint64_t)h * DS4_N_HEAD_DIM;
+            float *oh = ht + (uint64_t)h * DS4_N_HEAD_DIM;
+            memset(oh, 0, DS4_N_HEAD_DIM * sizeof(float));
+
+            // dot-product over KV rows
+            float max_score = DS4_NEG_INF;
+            for (uint32_t vi = 0; vi < n_visible; vi++) {
+                const float *kr = raw_kv + (uint64_t)vi * DS4_N_HEAD_DIM;
+                __m512 acc = _mm512_setzero_ps();
+                for (uint32_t d = 0; d < DS4_N_HEAD_DIM; d += 16) {
+                    __m512 qv = _mm512_loadu_ps(qh + d);
+                    __m512 kv = _mm512_loadu_ps(kr + d);
+                    acc = _mm512_add_ps(_mm512_mul_ps(qv, kv), acc);
+                }
+                float dot = _mm512_reduce_add_ps(acc) * attn_scale;
+                scores_buf[vi] = dot;
+                if (dot > max_score) max_score = dot;
+            }
+
+            // softmax (scalar exp, vectorized load/store)
+            float sum_exp = 0.0f;
+            __m512 vmax = _mm512_set1_ps(max_score);
+            for (uint32_t vi = 0; vi < n_visible; vi += 16) {
+                uint32_t nv = (vi + 16 <= n_visible) ? 16 : (n_visible - vi);
+                __m512 vs = _mm512_sub_ps(_mm512_loadu_ps(scores_buf + vi), vmax);
+                float tmp[16]; _mm512_storeu_ps(tmp, vs);
+                for (uint32_t k = 0; k < nv; k++) { tmp[k] = expf(tmp[k]); sum_exp += tmp[k]; }
+                _mm512_storeu_ps(scores_buf + vi, _mm512_loadu_ps(tmp));
+            }
+            float inv_sum = 1.0f / (sum_exp + 1e-10f);
+
+            // weighted sum
+            for (uint32_t vi = 0; vi < n_visible; vi++) {
+                float w = scores_buf[vi] * inv_sum;
+                const float *kr = raw_kv + (uint64_t)vi * DS4_N_HEAD_DIM;
+                __m512 vw = _mm512_set1_ps(w);
+                for (uint32_t d = 0; d < DS4_N_HEAD_DIM; d += 16) {
+                    __m512 ov = _mm512_loadu_ps(oh + d);
+                    __m512 kv = _mm512_loadu_ps(kr + d);
+                    _mm512_storeu_ps(oh + d, _mm512_add_ps(_mm512_mul_ps(vw, kv), ov));
+                }
+            }
+        }
+    }
+    free(scores_buf);
+}
+
+// ============================================================================
 // SwiGLU (AVX-512 with scalar sigmoid)
 // ============================================================================
 
@@ -1003,6 +1083,9 @@ void ds4_xeon_dequant_iq2xxs_block_to_u8(uint8_t *d, const void *x) {
 }
 void ds4_xeon_dequant_q2k_block_to_i16(int16_t *d, const void *x) {
     (void)d; (void)x;
+}
+void ds4_xeon_attn_scores(float *h, const float *q, const float *kv, uint32_t n, uint32_t il) {
+    (void)h; (void)q; (void)kv; (void)n; (void)il;
 }
 #endif
 
