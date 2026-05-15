@@ -39,6 +39,9 @@
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
+#if defined(__x86_64__)
+#include "ds4_xeon.h"
+#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -679,6 +682,10 @@ static void ds4_threads_init(void) {
     if (g_pool.initialized) return;
 
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+
+#if defined(__x86_64__)
+    ds4_xeon_threads_init();
+#endif
 
     uint32_t n_threads = 12;
     const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -15413,6 +15420,7 @@ const char *ds4_backend_name(ds4_backend backend) {
     case DS4_BACKEND_METAL: return "metal";
     case DS4_BACKEND_CUDA:  return "cuda";
     case DS4_BACKEND_CPU:   return "cpu";
+    case DS4_BACKEND_XEON:  return "xeon";
     }
     return "unknown";
 }
@@ -15502,6 +15510,9 @@ struct ds4_session {
     ds4_engine *engine;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
+#endif
+#if defined(__x86_64__)
+    ds4_xeon_graph xeon_graph;
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -15714,7 +15725,7 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
 #endif
 
 static bool ds4_session_is_cpu(const ds4_session *s) {
-    return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
+    return s && s->engine && (s->engine->backend == DS4_BACKEND_CPU || s->engine->backend == DS4_BACKEND_XEON);
 }
 
 static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
@@ -17093,7 +17104,7 @@ void ds4_engine_close(ds4_engine *e) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
-    if (e->backend == DS4_BACKEND_CPU) {
+    if (e->backend == DS4_BACKEND_CPU || e->backend == DS4_BACKEND_XEON) {
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;
         s->ctx_size = ctx_size;
@@ -17101,6 +17112,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+#if defined(__x86_64__)
+        if (e->backend == DS4_BACKEND_XEON) {
+            ds4_xeon_graph_init(&s->xeon_graph, s->prefill_cap);
+        }
+#endif
         *out = s;
         return 0;
     }
@@ -17144,6 +17160,11 @@ void ds4_session_free(ds4_session *s) {
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
+#if defined(__x86_64__)
+        if (s->engine && s->engine->backend == DS4_BACKEND_XEON) {
+            ds4_xeon_graph_free(&s->xeon_graph);
+        }
+#endif
     }
 #ifndef DS4_NO_GPU
     else {

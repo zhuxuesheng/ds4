@@ -159,5 +159,13 @@ endif
 test: ds4_test
 	./ds4_test
 
+xeon-bench:
+	$(CC) $(CFLAGS) -fopenmp -o tests/ds4_xeon_matmul_bench tests/ds4_xeon_matmul_bench.c $(LDLIBS)
+	./tests/ds4_xeon_matmul_bench
+
+xeon-math-test:
+	$(CC) $(CFLAGS) -o tests/ds4_xeon_math_test tests/ds4_xeon_math_test.c ds4_xeon.c $(LDLIBS)
+	./tests/ds4_xeon_math_test
+
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
