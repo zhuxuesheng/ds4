@@ -15525,6 +15525,7 @@ struct ds4_session {
 #endif
 #if defined(__x86_64__)
     ds4_xeon_graph xeon_graph;
+    ds4_xeon_predequant_weights predequant;
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -15543,6 +15544,93 @@ struct ds4_session {
 };
 
 #if defined(__x86_64__)
+/* Pre-dequantize one layer's expert weights into the supplied buffers.
+ * gate_up: [n_expert][2][n_embd][n_ff_exp] uint8 (gate then up interleaved)
+ * down:    [n_expert][n_ff_exp][n_embd] int16
+ * Uses AVX-512 vectorized block dequant (ds4_xeon_dequant_iq2xxs_block_to_u8).
+ * Called lazily when entering a new layer in the prefill/decode loop. */
+static void ds4_xeon_predequant_layer(
+        ds4_xeon_predequant_weights *w,
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        int layer_idx)
+{
+    int buf = w->current_buf;
+    if (w->cached_layer[buf] == layer_idx) return;  // already cached
+    w->cached_layer[buf] = layer_idx;
+    uint8_t *gate_up_dst = w->gate_up[buf];
+    int16_t *down_dst    = w->down[buf];
+    const uint32_t n_embd  = w->n_embd;
+    const uint32_t n_ff    = w->n_ff_exp;
+    const uint32_t n_expert = w->n_expert;
+
+    // Gate experts (IQ2XXS → uint8)
+    if (layer->ffn_gate_exps && layer->ffn_gate_exps->ndim == 3) {
+        uint64_t in_dim, out_dim, row_bytes;
+        const gguf_type_info *info = tensor_type(layer->ffn_gate_exps->type);
+        for (uint32_t e = 0; e < n_expert; e++) {
+            const uint8_t *src = tensor_expert_bytes(model,
+                layer->ffn_gate_exps, e, &in_dim, &out_dim, &row_bytes);
+            if (!info || info->block_elems == 0) continue;
+            uint64_t n_blocks = ((in_dim + info->block_elems - 1)
+                / info->block_elems) * out_dim;
+            uint8_t *dst = gate_up_dst
+                + ((uint64_t)e * 2 + 0) * (uint64_t)n_embd * n_ff;
+            for (uint64_t b = 0; b < n_blocks; b++) {
+                const ds4_xeon_block_iq2_xxs *block =
+                    (const ds4_xeon_block_iq2_xxs*)(
+                        src + b * info->block_bytes);
+                ds4_xeon_dequant_iq2xxs_block_to_u8(
+                    dst + b * DS4_XEON_QK_K, block);
+            }
+        }
+    }
+
+    // Up experts (IQ2XXS → uint8)
+    if (layer->ffn_up_exps && layer->ffn_up_exps->ndim == 3) {
+        uint64_t in_dim, out_dim, row_bytes;
+        const gguf_type_info *info = tensor_type(layer->ffn_up_exps->type);
+        for (uint32_t e = 0; e < n_expert; e++) {
+            const uint8_t *src = tensor_expert_bytes(model,
+                layer->ffn_up_exps, e, &in_dim, &out_dim, &row_bytes);
+            if (!info || info->block_elems == 0) continue;
+            uint64_t n_blocks = ((in_dim + info->block_elems - 1)
+                / info->block_elems) * out_dim;
+            uint8_t *dst = gate_up_dst
+                + ((uint64_t)e * 2 + 1) * (uint64_t)n_embd * n_ff;
+            for (uint64_t b = 0; b < n_blocks; b++) {
+                const ds4_xeon_block_iq2_xxs *block =
+                    (const ds4_xeon_block_iq2_xxs*)(
+                        src + b * info->block_bytes);
+                ds4_xeon_dequant_iq2xxs_block_to_u8(
+                    dst + b * DS4_XEON_QK_K, block);
+            }
+        }
+    }
+
+    // Down experts (Q2_K → int16)
+    if (layer->ffn_down_exps && layer->ffn_down_exps->ndim == 3) {
+        uint64_t in_dim, out_dim, row_bytes;
+        const gguf_type_info *info = tensor_type(layer->ffn_down_exps->type);
+        for (uint32_t e = 0; e < n_expert; e++) {
+            const uint8_t *src = tensor_expert_bytes(model,
+                layer->ffn_down_exps, e, &in_dim, &out_dim, &row_bytes);
+            if (!info || info->block_elems == 0) continue;
+            uint64_t n_blocks = ((in_dim + info->block_elems - 1)
+                / info->block_elems) * out_dim;
+            int16_t *dst = down_dst
+                + (uint64_t)e * in_dim * out_dim;
+            for (uint64_t b = 0; b < n_blocks; b++) {
+                const ds4_xeon_block_q2_K *block =
+                    (const ds4_xeon_block_q2_K*)(
+                        src + b * info->block_bytes);
+                ds4_xeon_dequant_q2k_block_to_i16(
+                    dst + b * DS4_XEON_QK_K, block);
+            }
+        }
+    }
+}
+
 /* Xeon-optimized FFN batch with expert token regrouping (Phase 7).
  *
  * T7.1 complete: builds inverted index expert→[tokens] for batch GEMM.
@@ -15568,9 +15656,6 @@ static void ds4_xeon_ffn_shared_batch(
     float *expert_weights[256] = {0}; // corresponding gate weights
     int    expert_count[256] = {0};
     int    expert_cap[256] = {0};
-    int   *token_experts[256] = {0};  // which experts each token selected (for scatter)
-    int    token_n_exp = 0;           // always DS4_N_EXPERT_USED
-
     for (int t = 0; t < n_tok; t++) {
         const float *inp_hc = next_f32 + (uint64_t)t * hc_dim;
         float *out_hc = cur_f32 + (uint64_t)t * hc_dim;
@@ -15595,7 +15680,7 @@ static void ds4_xeon_ffn_shared_batch(
         memset(selected, 0, sizeof(selected));
         memset(exp_w, 0, sizeof(exp_w));
         if (lw->ffn_gate_inp) {
-            layer_topk_selected_experts(selected, exp_w, lw, norm, DS4_N_EMBD);
+            layer_topk_selected_experts(selected, exp_w, model, lw, norm);
         }
 
         // Add to inverted index
@@ -15613,8 +15698,6 @@ static void ds4_xeon_ffn_shared_batch(
             expert_weights[eid][expert_count[eid]] = exp_w[ei];
             expert_count[eid]++;
         }
-
-        token_n_exp = DS4_N_EXPERT_USED; (void)token_n_exp;
 
         // --- Per-token MoE + shared FFN (CPU path for now) ---
         float moe_out[DS4_N_EMBD];
@@ -15678,6 +15761,9 @@ static void prefill_xeon_graph(
         fflush(stderr);
 
         const ds4_layer_weights *lw = &e->weights.layer[il];
+
+        // 0. Pre-dequantize this layer's expert weights (cached, once per layer)
+        ds4_xeon_predequant_layer(&s->predequant, &e->model, lw, (int)il);
 
         // 1. Attention (FP32)
         layer_attention_raw_swa_batch(next_f32,
@@ -17375,6 +17461,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_HC,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_N_LAYER,
                 -1 /* numa interleaved */);
+            ds4_xeon_predequant_init(&s->predequant, NULL,
+                DS4_N_LAYER, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         }
 #endif
         *out = s;
@@ -17423,6 +17511,7 @@ void ds4_session_free(ds4_session *s) {
 #if defined(__x86_64__)
         if (s->engine && s->engine->backend == DS4_BACKEND_XEON) {
             ds4_xeon_graph_free(&s->xeon_graph);
+            ds4_xeon_predequant_weights_free(&s->predequant);
         }
 #endif
     }

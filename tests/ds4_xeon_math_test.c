@@ -239,7 +239,7 @@ static float snr_db(const float *ref, const float *test, int n) {
 }
 
 // ============================================================================
-// Test 1: Roundtrip fidelity â€?FP32 â†?INT8 â†?FP32
+// Test 1: Roundtrip fidelity ï¿½?FP32 ï¿½?INT8 ï¿½?FP32
 // ============================================================================
 static int test_roundtrip_a8(const char *dist_name,
     void (*gen)(float *x, int n, int seed),
@@ -289,7 +289,7 @@ static int test_roundtrip_a8(const char *dist_name,
 }
 
 // ============================================================================
-// Test 2: Roundtrip fidelity â€?FP32 â†?INT16 â†?FP32
+// Test 2: Roundtrip fidelity ï¿½?FP32 ï¿½?INT16 ï¿½?FP32
 // ============================================================================
 static int test_roundtrip_a16(const char *dist_name,
     void (*gen)(float *x, int n, int seed),
@@ -543,7 +543,7 @@ static void bench_dequant_overhead(int n_blocks) {
     int iterations = 100;
     double bytes_per_iter = (double)n_blocks * 256.0 * 2.0; // int16 output
 
-    // Benchmark: full dequant (nibble â†?float â†?scale*q - min â†?clamp â†?int16)
+    // Benchmark: full dequant (nibble ï¿½?float ï¿½?scale*q - min ï¿½?clamp ï¿½?int16)
     double t0 = now_sec();
     for (int iter = 0; iter < iterations; iter++) {
         for (int b = 0; b < n_blocks; b++) {
@@ -553,7 +553,7 @@ static void bench_dequant_overhead(int n_blocks) {
     double t_dequant = now_sec() - t0;
     double gb_dequant = (bytes_per_iter * iterations) / t_dequant / 1e9;
 
-    // Benchmark: raw unpack only (nibble â†?int16, no arithmetic)
+    // Benchmark: raw unpack only (nibble ï¿½?int16, no arithmetic)
     double t1 = now_sec();
     for (int iter = 0; iter < iterations; iter++) {
         for (int b = 0; b < n_blocks; b++) {
@@ -731,6 +731,96 @@ static void bench_iq2xxs_throughput(int n_blocks) {
     free(blocks); free(activations);
 }
 
+// ============================================================================
+// Test 9: IQ2XXS block dequant to uint8 (T3.3.1 AVX-512 vectorized)
+// ============================================================================
+static void iq2xxs_dequant_block_ref(uint8_t *dst, const ds4_xeon_block_iq2_xxs *x) {
+    const uint16_t *qs = x->qs;
+    for (int j = 0; j < 32; j++) {
+        uint16_t q = qs[j];
+        uint64_t grid = iq2xxs_grid[q & 255];
+        uint8_t  signs = ksigns_iq2xs[q >> 8];
+        uint8_t *out = dst + j * 8;
+        for (int k = 0; k < 8; k++) {
+            int8_t v = (int8_t)((grid >> (k * 8)) & 0xFF);
+            if (signs & (1 << k)) v = -v;
+            out[k] = (uint8_t)((int16_t)v + 128);
+        }
+    }
+}
+
+static int test_iq2xxs_dequant_u8(void) {
+    ds4_xeon_block_iq2_xxs x;
+    x.d = f32_to_f16(0.5f);
+    for (int j = 0; j < 32; j++) {
+        uint8_t lo = (uint8_t)(rand() % 256);
+        uint8_t hi = (uint8_t)(rand() % 128);
+        x.qs[j] = (uint16_t)((uint16_t)hi << 8) | lo;
+    }
+
+    uint8_t vec[256], ref[256];
+    ds4_xeon_dequant_iq2xxs_block_to_u8(vec, &x);
+    iq2xxs_dequant_block_ref(ref, &x);
+
+    int mismatches = 0;
+    for (int i = 0; i < 256; i++) {
+        if (vec[i] != ref[i]) mismatches++;
+    }
+
+    printf("  mismatches=%d/256  %s\n", mismatches,
+        mismatches == 0 ? "PASS" : "FAIL");
+    return (mismatches == 0) ? 0 : 1;
+}
+
+static void bench_iq2xxs_dequant_u8(int n_blocks) {
+    ds4_xeon_block_iq2_xxs *blocks = (ds4_xeon_block_iq2_xxs*)
+        aligned_alloc(64, (size_t)n_blocks * sizeof(ds4_xeon_block_iq2_xxs));
+    uint8_t *buf = (uint8_t*)aligned_alloc(64, (size_t)n_blocks * 256);
+
+    srand(123);
+    for (int i = 0; i < n_blocks; i++) {
+        blocks[i].d = f32_to_f16(0.5f);
+        for (int j = 0; j < 32; j++) {
+            blocks[i].qs[j] = (uint16_t)((uint16_t)(rand() % 128) << 8)
+                              | (uint8_t)(rand() % 256);
+        }
+    }
+
+    int iterations = 1000;
+    double bytes_per_block = 256.0; // uint8 output per block
+
+    // Vectorized throughput
+    double t0 = now_sec();
+    for (int iter = 0; iter < iterations; iter++) {
+        for (int b = 0; b < n_blocks; b++) {
+            ds4_xeon_dequant_iq2xxs_block_to_u8(
+                buf + (size_t)b * 256, &blocks[b]);
+        }
+    }
+    double dt_vec = now_sec() - t0;
+    double gb_vec = (bytes_per_block * n_blocks * iterations) / dt_vec / 1e9;
+
+    // Scalar reference throughput
+    double t1 = now_sec();
+    for (int iter = 0; iter < iterations; iter++) {
+        for (int b = 0; b < n_blocks; b++) {
+            iq2xxs_dequant_block_ref(
+                buf + (size_t)b * 256, &blocks[b]);
+        }
+    }
+    double dt_ref = now_sec() - t1;
+    double gb_ref = (bytes_per_block * n_blocks * iterations) / dt_ref / 1e9;
+    double speedup = dt_ref / dt_vec;
+
+    printf("  n_blocks=%d  iterations=%d\n", n_blocks, iterations);
+    printf("    Scalar     : %.2f GB/s  %.3f s\n", gb_ref, dt_ref);
+    printf("    AVX-512    : %.2f GB/s  %.3f s\n", gb_vec, dt_vec);
+    printf("    Speedup    : %.1fx  %s\n", speedup,
+        speedup > 5.0 ? "PASS (>5x)" : "BELOW");
+
+    free(blocks); free(buf);
+}
+
 int main(void) {
     printf("=== DS4 Xeon Quantization Math Test ===\n\n");
 
@@ -780,6 +870,14 @@ int main(void) {
     // Test 8: IQ2XXS throughput benchmark
     printf("\n--- IQ2XXS Throughput ---\n");
     bench_iq2xxs_throughput(4096);
+
+    // Test 9: IQ2XXS block dequant to uint8 (T3.3.1)
+    printf("\n--- IQ2XXS Dequant to uint8 ---\n");
+    failures += test_iq2xxs_dequant_u8();
+
+    // Test 10: IQ2XXS dequant throughput
+    printf("\n--- IQ2XXS Dequant Throughput ---\n");
+    bench_iq2xxs_dequant_u8(8192);
 
     printf("\n=== %s ===\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return failures > 0 ? 1 : 0;
