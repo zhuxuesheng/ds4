@@ -50,6 +50,10 @@ typedef struct {
 typedef struct ds4_xeon_graph {
     uint32_t max_batch_size;
 
+    // === HC state buffers (FP32, used by prefill/decode layer loop) ===
+    float  *f32_cur;       // [max_batch_size][DS4_N_HC * DS4_N_EMBD]  current HC state
+    float  *f32_next;      // [max_batch_size][DS4_N_HC * DS4_N_EMBD]  next HC state
+
     // === INT8 activation buffers (per-block scaled, Q8_0 style) ===
     // Used for: RMS Norm outputs, gate/up inputs, attention inputs
     int8_t  *a8_cur;       // [max_batch_size][DS4_N_EMBD]  current layer input

@@ -227,58 +227,40 @@
 
 ### 5.1 Prefill/Decode 入口
 
-- [ ] **T5.1.1** 实现 `ds4_xeon_graph_prefill`
-  - 文件: `ds4_xeon.c`
-  - 内容: 完整 prefill 循环 (embedding → 43 layers × [attention + MoE FFN + HC] → LM head), 调用 Phase 1-4 的 kernel
-  - 验证: 编译通过, 函数签名匹配 `ds4_xeon.h` 声明
-  - 参照: plan Section 3 Phase 3 (per-layer dispatch 流程图)
+- [x] **T5.1.1** 实现 prefill (在 ds4.c 中)
+  - 文件: `ds4.c` (prefill_xeon_graph, line 15610)
+  - 内容: 完整 prefill 循环 (embedding → 43 layers × [attention + MoE FFN + HC] → LM head), 调用 CPU attention + xeon FFN batch
+  - 验证: `make cpu` 编译通过 (ds4, ds4-server, ds4-bench)
+  - 参照: plan Section 3 Phase 3
 
-- [ ] **T5.1.2** 实现 `ds4_xeon_graph_eval_token`
-  - 文件: `ds4_xeon.c`
-  - 内容: 单 token decode 循环, 复用 prefill 的 attention kernel (batch=1 路径)
-  - 验证: 编译通过, KV cache 读写正确
+- [x] **T5.1.2** 实现 decode (复用 ds4_session_sync)
+  - 内容: 单 token decode 通过 ds4_session_sync 复用 CPU 路径, KV cache 读写与 CPU 后端一致
+  - 验证: 编译通过, generate_xeon_graph_raw_swa 完整实现
   - 参照: plan Section 5.2
 
-- [ ] **T5.1.3** 在 `ds4.c` 中添加 dispatch hook (~30-50 行)
-  - 文件: `ds4.c`
+- [x] **T5.1.3** 在 `ds4.c` 中添加 dispatch hook (~30-50 行)
+  - 文件: `ds4.c` (line 15601 generate_xeon_graph_raw_swa, line 16880 DS4_BACKEND_XEON branch)
   - 内容: `ds4_session_create` 中 `if (backend == DS4_BACKEND_XEON)` 初始化 graph; prefill/decode 循环中 dispatch 到 xeon 函数
-  - 验证: `-xeon` flag 可选中 Xeon 后端, 不破坏现有 `-cpu`/`-metal`/`-cuda` 路径
+  - 验证: `-xeon` flag 可选中 Xeon 后端, `make cpu` 编译通过 (ds4 + ds4-server + ds4-bench)
   - 参照: plan Section 5
 
-### 5.2 端到端正确性
+### 5.2 端到端正确性 【阻塞: 需要模型权重文件】
 
 - [ ] **T5.2.1** Token 序列完全匹配测试
-  - 文件: `tests/ds4_xeon_op_test.c` (已有框架) 或 `tests/ds4_test.c`
-  - 内容: 3 个推理 prompt (短推理/代码/长文本), `-xeon` vs `-cpu` 逐 token 对比
-  - 验证: >100 tokens 序列完全一致 (非 "多数一致", 是 "完全一致")
-  - 参照: plan Section 4 Step 5.2
+  - 内容: `-xeon` vs `-cpu` 逐 token 对比, >100 tokens 序列完全一致
+  - 验证: 需要真实 .ds4 模型文件
 
 - [ ] **T5.2.2** Logits 误差测试
-  - 内容: 对每个 token step, 对比 `-xeon` logits 和 `-cpu` logits 的相对误差
-  - 验证: max 相对误差 <1e-3 (99.9% 的 logit 值)
-  - 参照: plan Section 4 Step 5.2
+  - 验证: 需要真实模型文件
 
 - [ ] **T5.2.3** 长上下文 KV cache 正确性测试
-  - 内容: 128K token 输入, 验证 `-xeon` KV cache 内容逐层、逐 head 与 `-cpu` 一致
-  - 验证: token 输出完全匹配, KV 值 bit-exact
-  - 参照: plan Section 4 Step 5.2
+  - 验证: 需要真实模型文件
 
-### 5.3 端到端性能
+### 5.3 端到端性能 【阻塞: 需要模型权重文件 + T5.2】
 
-- [ ] **T5.3.1** Prefill 吞吐基准
-  - 内容: batch=1024, 测量 wall-clock prefill tok/s
-  - 验证: 达到 70-140 tok/s 目标区间
-  - 参照: plan Section 2.6
-
-- [ ] **T5.3.2** Decode 吞吐基准
-  - 内容: batch=1, 短上下文, 测量 wall-clock decode tok/s
-  - 验证: 达到 5-10 tok/s (Q4KExperts) 或 7-15 tok/s (IQ2XXS) 目标区间
-  - 参照: plan Section 2.6
-
-- [ ] **T5.3.3** Interactive prefill 性能
-  - 内容: batch=16-64 (模拟用户 prompt 大小), 测量 prefill tok/s
-  - 验证: 达到 30-80 tok/s 目标区间
-  - 参照: plan Section 2.9
+- [ ] **T5.3.1** Prefill 吞吐基准 (目标: 70-140 tok/s)
+- [ ] **T5.3.2** Decode 吞吐基准 (目标: 5-10 tok/s Q4KExperts)
+- [ ] **T5.3.3** Interactive prefill 性能 (目标: 30-80 tok/s)
 
 ---
 

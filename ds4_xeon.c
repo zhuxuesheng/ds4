@@ -1022,12 +1022,15 @@ void ds4_xeon_graph_init(ds4_xeon_graph *g, uint32_t max_batch_size,
     const uint32_t mb = max_batch_size;
     const int block_size = 64;
     const int n_blocks = (int)n_embd / block_size;
+    const size_t hc_size = (size_t)mb * (size_t)n_hc * (size_t)n_embd;
 
     #define XALLOC(ptr, count, type) \
         do { (ptr) = (type*)aligned_alloc(64, (size_t)(count) * sizeof(type)); \
              if (!(ptr)) { fprintf(stderr, "ds4_xeon: OOM at %s\n", #ptr); exit(1); } \
              memset((ptr), 0, (size_t)(count) * sizeof(type)); } while(0)
 
+    XALLOC(g->f32_cur,    hc_size, float);
+    XALLOC(g->f32_next,   hc_size, float);
     XALLOC(g->a8_cur,     (size_t)mb * n_embd, int8_t);
     XALLOC(g->a8_scale,   (size_t)mb * n_blocks, float);
     XALLOC(g->a16_mid,    (size_t)mb * n_ff_exp, int16_t);
@@ -1051,6 +1054,7 @@ void ds4_xeon_graph_init(ds4_xeon_graph *g, uint32_t max_batch_size,
 
 void ds4_xeon_graph_free(ds4_xeon_graph *g) {
     if (!g) return;
+    free(g->f32_cur);    free(g->f32_next);
     free(g->a8_cur);     free(g->a8_scale);
     free(g->a16_mid);    free(g->a16_mid_scale);
     free(g->a16_residual);

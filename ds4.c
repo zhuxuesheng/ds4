@@ -15543,6 +15543,61 @@ struct ds4_session {
 };
 
 #if defined(__x86_64__)
+/* Xeon-optimized FFN batch: MoE routed experts + shared FFN.
+ * Currently delegates to the CPU per-token FFN path for correctness.
+ * TODO: replace with VNNI matmul kernels once pre-dequant weights are ready. */
+static void ds4_xeon_ffn_shared_batch(
+        float             * cur_f32,
+        ds4_engine        * e,
+        const ds4_layer_weights * lw,
+        const float       * next_f32,
+        const int         * tokens,
+        int                 n_tok,
+        int                 il)
+{
+    const ds4_model *model = &e->model;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+
+    for (int t = 0; t < n_tok; t++) {
+        const float *inp_hc = next_f32 + (uint64_t)t * hc_dim;
+        float *out_hc = cur_f32 + (uint64_t)t * hc_dim;
+
+        // HC pre-FFN
+        float hc_ffn_inp[DS4_N_HC * DS4_N_EMBD];
+        float hc_ffn_post[DS4_N_HC * DS4_N_EMBD];
+        float hc_ffn_comb[DS4_N_HC * DS4_N_HC];
+        hc_pre_from_state_one(model,
+            lw->hc_ffn_fn, lw->hc_ffn_scale, lw->hc_ffn_base,
+            inp_hc, hc_ffn_inp, hc_ffn_post, hc_ffn_comb);
+        memcpy(out_hc, inp_hc, hc_dim * sizeof(float));
+
+        // RMS Norm
+        float norm[DS4_N_EMBD];
+        rms_norm_weight(norm, hc_ffn_inp,
+            tensor_data(model, lw->ffn_norm),
+            DS4_N_EMBD, DS4_RMS_EPS);
+
+        // Routed MoE (reuse CPU implementation)
+        float moe_out[DS4_N_EMBD];
+        memset(moe_out, 0, sizeof(moe_out));
+        layer_routed_moe_one(moe_out, model, lw, norm,
+            il, tokens[t], -1.0f, false);
+
+        // Shared FFN
+        float shared_out[DS4_N_EMBD];
+        memset(shared_out, 0, sizeof(shared_out));
+        layer_shared_ffn_one(shared_out, model, lw, norm);
+
+        // Combine
+        for (int i = 0; i < DS4_N_EMBD; i++)
+            moe_out[i] += shared_out[i];
+
+        // HC post-FFN
+        hc_post_one(out_hc, moe_out, inp_hc, hc_ffn_post, hc_ffn_comb,
+            DS4_N_EMBD, DS4_N_HC);
+    }
+}
+
 /* High-performance Xeon prefill using the static graph and VNNI math. */
 static void prefill_xeon_graph(
         float             * logits,
@@ -17261,7 +17316,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
 #if defined(__x86_64__)
         if (e->backend == DS4_BACKEND_XEON) {
-            ds4_xeon_graph_init(&s->xeon_graph, s->prefill_cap);
+            ds4_xeon_graph_init(&s->xeon_graph, s->prefill_cap,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_HC,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_N_LAYER,
+                -1 /* numa interleaved */);
         }
 #endif
         *out = s;
