@@ -15689,7 +15689,16 @@ static void ds4_xeon_ffn_shared_batch(
         }
     }
 
-    // --- MoE: AVX-512 instant matvec via ds4_xeon_routed_moe_one_expert ---
+    // --- MoE: AVX-512 instant matvec with cached expert tensor pointers ---
+    // Cache tensor_expert_bytes results per expert (same expert accessed by
+    // multiple tokens, so compute gate/up/down pointers once per expert).
+    const uint8_t *x_gate[DS4_N_EXPERT] = {0};
+    const uint8_t *x_up[DS4_N_EXPERT]   = {0};
+    const uint8_t *x_down[DS4_N_EXPERT] = {0};
+    uint64_t x_grb[DS4_N_EXPERT] = {0};
+    uint64_t x_urb[DS4_N_EXPERT] = {0};
+    uint64_t x_drb[DS4_N_EXPERT] = {0};
+
     for (int t = 0; t < n_tok; t++) {
         float *norm = h_norm + (uint64_t)t * DS4_N_EMBD;
         float *moe_t = h_moe + (uint64_t)t * DS4_N_EMBD;
@@ -15700,18 +15709,23 @@ static void ds4_xeon_ffn_shared_batch(
             float ew = h_token_ew[t][ei];
             if (fabsf(ew) < 1e-9f) continue;
 
-            uint64_t in_dim, out_dim, row_bytes;
-            const uint8_t *gate_data = tensor_expert_bytes(model,
-                lw->ffn_gate_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
-            uint64_t grb = row_bytes;
-            const uint8_t *up_data = tensor_expert_bytes(model,
-                lw->ffn_up_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
-            uint64_t urb = row_bytes;
-            const uint8_t *down_data = tensor_expert_bytes(model,
-                lw->ffn_down_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
+            // Cache expert tensor pointers on first access
+            if (!x_gate[eid]) {
+                uint64_t in_dim, out_dim, row_bytes;
+                x_gate[eid] = tensor_expert_bytes(model,
+                    lw->ffn_gate_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
+                x_grb[eid] = row_bytes;
+                x_up[eid] = tensor_expert_bytes(model,
+                    lw->ffn_up_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
+                x_urb[eid] = row_bytes;
+                x_down[eid] = tensor_expert_bytes(model,
+                    lw->ffn_down_exps, (uint32_t)eid, &in_dim, &out_dim, &row_bytes);
+                x_drb[eid] = row_bytes;
+            }
 
             ds4_xeon_routed_moe_one_expert(moe_t, norm,
-                gate_data, up_data, down_data, grb, urb, row_bytes, ew);
+                x_gate[eid], x_up[eid], x_down[eid],
+                x_grb[eid], x_urb[eid], x_drb[eid], ew);
         }
     }
     (void)s; (void)il; (void)tokens;
