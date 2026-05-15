@@ -266,6 +266,75 @@ These are already very strong numbers for CPU-only inference on a ~300B-paramete
 
 **The gap between row 1 and row 4 is where most inference optimization projects spend their time.** The architecture design (Sections 3-5) systematically addresses each degradation layer.
 
+### 2.8 Execution Timeline Analysis (Latency Accounting)
+
+While the bottleneck analysis above is throughput-oriented, CPU inference ultimately requires latency accounting — understanding where each microsecond of a token step is spent. This section estimates the wall-clock breakdown for both prefill and decode.
+
+**Decode (single token, batch=1) — per-layer timeline estimate:**
+
+| Step | Dominant Cost | Estimate (μs) | % of Layer |
+|---|---|---|---|
+| Router: gate_inp matvec (4096×256, F16) | Compute (FMA) | ~3 | <1% |
+| Router: softmax + top-k | Compute | ~2 | <1% |
+| Expert dispatch (token → worker group) | Synchronization | ~5 | 1% |
+| Expert gate matvec (4096×2048, INT8) ×6 | Memory (weight read ~24 MB) | ~400 | 30% |
+| Expert up matvec (4096×2048, INT8) ×6 | Memory (weight read ~24 MB) | ~400 | 30% |
+| SwiGLU (2048-dim ×6) | Compute | ~5 | <1% |
+| Quantize mid (A16, 2048×6) | Compute | ~10 | 1% |
+| Expert down matvec (2048×4096, INT16) ×6 | Memory (weight read ~24 MB) | ~300 | 22% |
+| Shared FFN (gate+up+down, INT8) | Memory (weight read ~12 MB) | ~80 | 6% |
+| Attention Q/K/V/O (Q8_0) | Memory (weight read ~20 MB) | ~60 | 5% |
+| KV cache read (per layer, short context) | Memory (small) | ~15 | 1% |
+| KV cache read (per layer, 128K context) | Memory (~64 MB/layer) | **~500** | **dominant** |
+| Barrier synchronization (×3) | Inter-thread | ~15 | 1% |
+| Residual add + RMS Norm | Compute | ~10 | 1% |
+| **Total per layer (short context)** | | **~1305 μs** | |
+| **×43 layers (short context)** | | **~56 ms** | **~18 tok/s** |
+| **×43 layers (128K context)** | | **~76 ms** | **~13 tok/s** |
+
+**Key observations from timeline:**
+1. Expert weight reads dominate (>80% of layer time) — confirming decode is memory-bound
+2. Router and SwiGLU compute combined are <2% of layer time — optimizing them yields negligible gain
+3. At 128K context, KV cache read per layer (~64 MB) rivals expert weight reads (~72 MB), nearly doubling layer latency
+4. Barrier synchronization at 3 points × 5μs = 15μs/layer — modest but not free (~15ms total per token for attention + router + shared FFN barriers)
+5. Per-layer dequant overhead (if NOT pre-dequantized) would add ~150-200μs/layer — the pre-dequant decision eliminates this entirely
+
+**Prefill (batch=1024) — per-layer compute breakdown:**
+
+Unlike decode, prefill with large batch shifts from memory-bound to cache-and-compute-bound. With expert batching (Phase 5), the key change is that each expert's weights, once loaded, process **multiple tokens** before eviction:
+
+| Step | Dominant Cost | Estimate (ms) | Note |
+|---|---|---|---|
+| Router (1024×4096×256, batched) | Compute | ~2 | All tokens batched |
+| Expert dispatch + regroup | Scheduling | ~5 | Token regrouping (Phase 5) |
+| Expert gate/up (batched, INT8) | Compute (cache-resident weights) | ~15 | 256 experts, each processes its tokens |
+| SwiGLU (batched) | Compute | ~3 | Parallel across expert groups |
+| Expert down (batched, INT16) | Compute | ~10 | Same expert grouping |
+| Shared FFN (batched, INT8) | Compute | ~5 | All tokens |
+| Attention Q/K/V (batched, INT8) | Compute | ~8 | All tokens, prefill KV construction |
+| Attention QK^T (1024×seq, FP32) | **Compute** | **~15** | O(n_tok² · seq_len) — grows with prefill length |
+| KV cache write (per layer) | Memory (write) | ~3 | Store new KV entries |
+| Barriers (×3) | Inter-thread | ~0.5 | Lower overhead with batched work |
+| **Total per layer** | | **~66 ms** | |
+| **×43 layers** | | **~2.8 s** | **~360 tok/s prefill** |
+
+**The gap between 360 tok/s (timeline) and 70-140 tok/s (conservative target):** the timeline assumes near-perfect cache locality from expert batching and no DRAM stall. The conservative target accounts for real-world cache misses, memory controller contention, frequency throttling, and load imbalance across expert groups. The timeline serves as an upper bound for what the architecture can achieve under ideal conditions; the conservative estimate is what to expect in production.
+
+### 2.9 Prefill Performance Revisited: The Batch Size Effect
+
+The 70-140 tok/s target is for batch=1024. Prefill throughput is highly sensitive to batch size because expert weight reads are amortized:
+
+| Batch Size | Effective Throughput | Bottleneck |
+|---|---|---|
+| 1 (decode) | 5-10 tok/s | Memory random access |
+| 8 | 15-30 tok/s | Memory + limited amortization |
+| 64 | 40-80 tok/s | Cache pressure from expert diversity |
+| 256 | 60-120 tok/s | Compute emerging |
+| 1024 | 70-140 tok/s | Compute + cache |
+| 2048 | 80-150 tok/s | Compute + memory controller saturation |
+
+For interactive prefill (batch=16-64 tokens from a user prompt), expect **30-80 tok/s** — lower than the large-batch benchmark number. This is the number that matters for perceived responsiveness.
+
 ## 3. Scheme Design: Hybrid-Precision VNNI Graph
 
 We will replace the dynamic memory allocation (`ds4_cpu_decode_scratch`) with a static, NUMA-aware execution graph (`ds4_xeon_graph`).
@@ -369,6 +438,74 @@ Worker group model: each expert (or small contiguous expert group) is assigned t
 
 This reduces barriers from ~6 per layer (fully synchronous) to ~3 per layer (router, attention, shared FFN). The expert compute phase operates with work-stealing between expert groups within each socket.
 
+### Phase 5: Expert Batching & LLC-Aware Scheduling (Token Regrouping)
+
+Even with NUMA-local expert access (Phase 1), cache utilization remains poor if each expert processes only a single token before eviction. The MoE routing pattern creates a natural opportunity for **token regrouping** — reordering the computation so that all tokens routed to the same expert are processed together.
+
+**Problem**: Naively, the inference loop iterates per-token: for each token, load 6 expert weights, compute, discard. For batch=1024 with 256 experts, each expert is activated by ~24 tokens on average, but these tokens are scattered across the iteration order. Without regrouping, each expert's weights may be loaded 24 separate times, each time evicting and re-fetching from DRAM.
+
+**Solution — Token regroup by expert before matmul:**
+
+```
+After router top-k (all tokens have their 6 expert selections):
+
+Step A: Build inverted index
+  expert → list of (token_id, gate_score)
+  
+  expert_0:  [token_3, token_18, token_52, ...]  (~24 tokens avg)
+  expert_1:  [token_7, token_22, ...]
+  ...
+  expert_255: [...]
+
+Step B: Per expert, batched GEMM
+  For each expert e:
+    tokens_e = tokens routed to expert e
+    gate_e  = gate projection (4096 × 2048, INT8)  × batched tokens
+    up_e    = up projection   (4096 × 2048, INT8)  × batched tokens
+    mid_e   = SwiGLU(gate_e, up_e)                  × batched tokens
+    down_e  = down projection (2048 × 4096, INT16) × batched tokens
+    scatter results back to per-token residual buffers
+```
+
+**Cache benefit**: Expert e's weight matrices (gate/up/down) are loaded once into L3, then reused across all tokens assigned to that expert. For batch=1024 with uniform routing:
+- Without regrouping: ~24 independent loads of each expert's weights → ~24 × L3 miss penalty
+- With regrouping: 1 load of each expert's weights → amortized across ~24 tokens
+
+This transforms the cache behavior from "perpetual cold start" to "streaming with L3 reuse." The effective L3 hit rate for expert weights increases from near-zero to potentially >80% (limited by L3 capacity per socket: 36 MB can hold ~2-3 expert weight sets at a time in INT8 format).
+
+**Implementation**: The inverted index (expert → token list) is constructed after router top-k using a parallel radix sort or atomic scatter. The regrouping step adds ~5ms of scheduling overhead per layer, which is recovered many times over by the cache improvement.
+
+**Interaction with NUMA replication**: Token regrouping operates independently within each socket. Socket 0 threads process the subset of tokens assigned to Socket 0, regrouping them by expert against Socket 0's local weight replica. Socket 1 does the same independently. No cross-socket coordination needed.
+
+### Phase 6: Speculative Decoding for Interactive Latency
+
+CPU inference's fundamental challenge is single-token decode latency. Even at 10 tok/s (100ms/token), interactive use feels sluggish. Speculative decoding amortizes this latency by generating multiple tokens per inference step.
+
+**Draft model approach:**
+
+```
+Main model (DeepSeek V4 Flash, ~300B, Q4_K): verifier
+Draft model (~1-3B params, INT8): proposer
+
+Per decode step:
+  1. Draft model generates K candidate tokens (fast, ~2-5ms each)
+  2. Main model verifies all K tokens in one forward pass
+     (KV cache prefill-style: process K draft tokens as a micro-batch)
+  3. Accept matching prefix, reject from first mismatch
+  4. Average accepted tokens per step: ~2-4 (depending on draft quality)
+```
+
+**Why this works on CPU**: The main model's expert weight reads (7.6 GB/token) are the bottleneck. By verifying K draft tokens in one pass, the weight reads are amortized across K tokens. The draft model runs on a small subset of cores using a separate, tiny weight buffer that stays resident in L3.
+
+**Expected latency improvement**: At 10 tok/s baseline decode (100ms/token), speculative decoding with K=4 draft tokens and 60% acceptance rate (~2.4 tokens/step) reduces perceived latency to ~40ms/token equivalent — a 2.5× improvement in interactive responsiveness.
+
+**Draft model options**:
+1. A separate small transformer (e.g., a 1B LLaMA-style model) — highest quality, separate model file
+2. Layer-early-exit from the main model — uses existing weights, lower quality but zero extra memory
+3. N-gram / statistical draft — cheapest, lowest quality, useful as baseline
+
+The speculative decoding infrastructure should be designed as a **separate scheduling layer** on top of the Xeon graph runtime, rather than embedded in the per-layer dispatch. This keeps the core inference loop clean and allows draft model strategies to be swapped independently.
+
 ## 4. Development Roadmap
 
 Implementation via a dedicated `DS4_BACKEND_XEON` backend, following test-driven phases.
@@ -413,6 +550,21 @@ Implementation via a dedicated `DS4_BACKEND_XEON` backend, following test-driven
 2. **Attention prefetching:** Prefetch next-layer KV blocks while computing current layer's FFN, using software prefetch (`_mm_prefetch`) to hide DRAM latency.
 3. **FP8 KV cache:** Explore FP8 quantization for KV cache (`dsv4_fp8_kv_quantize_row_inplace_cpu` already exists in `ds4.c`) — halves KV cache memory traffic at long context.
 
+### Step 7: Expert Batching (Token Regrouping)
+**Goal:** Maximize L3 cache reuse by grouping tokens by expert assignment before matmul.
+1. **Inverted index construction:** After router top-k, build expert→token mapping using parallel atomic scatter or radix sort. Overhead target: <5ms per layer.
+2. **Batched expert GEMM:** Per expert, accumulate all assigned tokens into a micro-batch, load expert weights once, process all tokens before eviction.
+3. **Per-socket regrouping:** Independent regrouping within each NUMA node. Socket 0 tokens regrouped against Socket 0's local weight replica; Socket 1 independently.
+4. **LLC miss profiling:** Use `perf stat -e LLC-load-misses,LLC-store-misses` to verify regrouping eliminates redundant expert weight loads. Target: >80% LLC hit rate for expert weights (up from near-zero without regrouping).
+5. **Prefill benchmark:** Batch=1024 with regrouping — measure wall-clock improvement vs. naive per-token iteration.
+
+### Step 8: Speculative Decoding Infrastructure
+**Goal:** Reduce perceived interactive decode latency via draft-model verification.
+1. **Draft model integration:** Select and integrate a small (~1B param) draft model. Allocate dedicated weight buffer pinned to L3.
+2. **Verification pass:** Main model verifies K draft tokens in one micro-batch forward pass, reusing the prefill graph path.
+3. **Acceptance tracking:** Measure draft acceptance rate across diverse prompts (code, reasoning, conversation). Target: >50% acceptance for K=4.
+4. **Latency benchmark:** Compare wall-clock time per generated token with/without speculative decode. Target: >2× effective tok/s improvement for interactive use.
+
 ## 5. Architectural Shift: The "Plugin" Graph Model
 
 To minimize modifications to the core `ds4.c` engine and facilitate seamless upstream merges, the Xeon backend will be treated as a first-class, "plugin-style" Graph Backend, mirroring the architectural pattern established by Metal and CUDA.
@@ -453,16 +605,46 @@ This approach guarantees that `ds4.c` remains largely untouched (~30-50 lines of
 
 **Solution**: Worker-group model with per-expert thread pools. Expert compute (gate/up → SwiGLU → down) proceeds asynchronously within each worker group, with a single global barrier at result aggregation. This reduces per-layer barriers from ~6 to ~3.
 
-## 7. Hardware Upgrade Path
+## 7. Next Steps: From Design to Measurement
 
-The W4A8/W2A8 mixed precision architecture on Ice Lake targets **70-140 tok/s prefill** and **5-15 tok/s decode** — strong results for a CPU-only ~300B MoE model.
+The architecture design is now at a stage where the **largest remaining risk is not design error but whether real profiling data validates the assumptions**. The following measurement priorities are ordered by impact on the performance model:
+
+### Priority 1: Microbenchmarks (Validate Foundation)
+
+| # | Benchmark | What It Validates | Success Criterion |
+|---|---|---|---|
+| 1 | Pre-dequant throughput | Dequant overhead claim (30-50%) | >9 TOPS (VPDPBUSD, pre-dequantized INT8) |
+| 2 | Hugepage impact | TLB miss claim (15-30% overhead) | >15% speedup with 1GB pages vs. 4KB |
+| 3 | NUMA replication impact | Cross-socket penalty claim | <5% performance difference between local and remote expert access |
+| 4 | Expert regroup batching | L3 reuse claim (>80% hit rate) | `perf stat` LLC hit rate >80% with regrouping vs. <20% without |
+| 5 | Barrier profiling | Barrier overhead claim (5μs/barrier) | <10μs per barrier at 48 threads, dual-socket |
+| 6 | LLC miss profiling | Cache hierarchy claim | Quantify expert weight LLC miss rate across layer iterations |
+| 7 | Token routing entropy | Expert selection distribution | Measure stddev of tokens-per-expert; validate uniform-ish distribution assumption |
+
+### Priority 2: End-to-End Integration
+
+1. Integrate pre-dequant loader + static graph + NUMA replication into a single end-to-end path.
+2. Run the reference comparison test (identical token stream as `-cpu`).
+3. Measure wall-clock prefill and decode on real prompts.
+
+### Priority 3: Iterative Tuning
+
+Based on profiling data, adjust:
+- Worker group sizes and thread pinning strategy
+- Expert batching granularity (per-expert vs. expert-group)
+- Prefetch distance for attention KV cache
+- Speculative decoding K and draft model selection
+
+## 8. Hardware Upgrade Path
+
+The W4A8/W2A8 mixed precision architecture on Ice Lake targets **70-140 tok/s prefill** and **5-15 tok/s decode** (interactive prefill 30-80 tok/s) — strong results for a CPU-only ~300B MoE model.
 
 For higher throughput targets:
 
-1. **Sapphire Rapids / Granite Rapids with AMX**: AMX tile-based matrix multiply (2048 INT8 ops/cycle/tile) delivers **50-100 TOPS** in practice. Combined with the same architecture (static graph, NUMA replication, pre-dequant, mixed precision), this enables **500-1500 tok/s prefill**.
+1. **Sapphire Rapids / Granite Rapids with AMX**: AMX tile-based matrix multiply (2048 INT8 ops/cycle/tile) delivers **50-100 TOPS** in practice. Combined with the same system architecture (static graph, NUMA replication, pre-dequant, expert batching, mixed precision), this enables **500-1500 tok/s prefill**.
 
-2. **Speculative decoding**: For CPU-only deployments, speculative decoding (draft model + verification) is the most effective way to improve perceived decode latency. A small draft model (~1B params) running on a few cores can generate candidate tokens at high speed, with the main model verifying in parallel.
+2. **Speculative decoding**: For interactive CPU deployments, speculative decoding is the single most effective latency improvement. Detailed design in Phase 6 (Section 3). A small draft model (~1B params) with 60% acceptance rate yields >2× effective tok/s improvement for interactive use.
 
-3. **Batch-prefill optimization**: For large batch prefill (1024+ tokens), group tokens by expert assignment and fuse expert computation across tokens. This improves L3 cache hit rate by ensuring each expert's weights, once loaded, process multiple tokens before eviction.
+3. **FP8 KV cache**: Compress KV cache to FP8 (infrastructure already in `ds4.c`) to reduce KV memory traffic by 50% at long context. Essential for 128K+ context scenarios.
 
-4. **FP8 KV cache**: Compress KV cache to FP8 (infrastructure already present in `ds4.c`) to reduce KV memory traffic by 50% at long context lengths.
+4. **Multi-node inference**: For model parallelism across multiple dual-socket nodes, the static graph architecture can be extended with inter-node expert partitioning (each node owns a subset of experts) and token routing across nodes. This is a future direction beyond the scope of single-node optimization.
