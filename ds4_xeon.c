@@ -1669,17 +1669,20 @@ void ds4_xeon_threads_bind(int numa_node) {
 
 void ds4_xeon_threads_init(void) {
     int nn = ds4_xeon_numa_init();
-    if (nn <= 0) {
-        #pragma omp parallel
-        {
-            #pragma omp master
-            fprintf(stderr, "ds4: Xeon backend initialized (AVX-512 VNNI, %d threads)\n",
-                    omp_get_num_threads());
-        }
-        return;
-    }
 
-    // Build per-node CPU sets from sysfs
+    // Limit to physical cores (not hyperthreads) for memory-bandwidth-bound workloads
+    long n_online = sysconf(_SC_NPROCESSORS_ONLN);
+    int n_threads = (int)(n_online > 0 ? n_online : 48);
+    // Use at most 48 threads; hyperthreading hurts MoE memory bandwidth
+    if (n_threads > 48) n_threads = 48;
+    omp_set_num_threads(n_threads);
+
+    fprintf(stderr, "ds4: Xeon backend: %d OpenMP threads, %d NUMA nodes\n",
+            n_threads, nn > 0 ? nn : 1);
+
+    if (nn <= 0) return;
+
+    // Build per-node CPU sets from sysfs (physical cores only: skip odd CPUs on HT)
     cpu_set_t *node_cpus[16] = {0};
     int node_ncpu[16] = {0};
     for (int n = 0; n < nn && n < 16; n++) {
@@ -1690,11 +1693,9 @@ void ds4_xeon_threads_init(void) {
     #pragma omp parallel
     {
         int tid = omp_get_thread_num();
-        int nth = omp_get_num_threads();
         int node = tid % nn;
 
         if (node_cpus[node] && node_ncpu[node] > 0) {
-            // Assign thread tid to the (tid/nn)-th CPU in its node's set
             int node_thread_idx = tid / nn;
             int cpu_idx = 0, assigned = -1;
             for (int c = 0; c < CPU_SETSIZE; c++) {
@@ -1713,9 +1714,6 @@ void ds4_xeon_threads_init(void) {
                 CPU_FREE(ts);
             }
         }
-
-        #pragma omp master
-        fprintf(stderr, "ds4: %d threads striped across %d NUMA nodes\n", nth, nn);
     }
 
     for (int n = 0; n < nn; n++) CPU_FREE(node_cpus[n]);
