@@ -16634,6 +16634,187 @@ static void prefill_xeon_graph(
     }
 }
 
+/* Xeon decode: single token through all layers.
+ * Uses CPU attention (known-correct KV cache, RoPE, compressor) and
+ * xeon VNNI FFN with pre-dequantized weights.
+ * This is the hot path called from ds4_session_sync for incremental decode. */
+static void ds4_xeon_decode_token(
+        float             * logits,
+        ds4_engine        * e,
+        ds4_session       * s,
+        int                 token,
+        uint32_t            pos)
+{
+    ds4_cpu_decode_scratch *scratch = &s->cpu_scratch;
+    ds4_xeon_predequant_weights *pre = &s->predequant;
+
+    /* embedding → HC init */
+    embed_token_f16(&e->model, &e->weights, token, scratch->plain);
+    hc_from_plain_embedding(scratch->cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
+
+    const uint32_t n_hc = DS4_N_HC;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *lw = &e->weights.layer[il];
+        ds4_layer_cache *cache = &s->cpu_cache.layer[il];
+
+        /* Lazy pre-dequant this layer (double-buffered: ping-pong) */
+        if (pre->gate_up[0]) {
+            int buf = il & 1;  /* ping-pong: layer 0→buf0, 1→buf1, 2→buf0, ... */
+            pre->current_buf = buf;
+            /* only dequant if not already cached */
+            if (pre->cached_layer[buf] != (int)il) {
+                pre->cached_layer[buf] = (int)il;
+                for (int eid = 0; eid < DS4_N_EXPERT; eid++)
+                    ds4_xeon_predequant_expert(pre, &e->model, lw, eid);
+            }
+        }
+
+        /* ---- 1. CPU Attention (same as layer_forward_raw_swa_one) ---- */
+        float post[4], comb[16];
+
+        memcpy(scratch->attn_residual, scratch->cur,
+               (size_t)n_hc * DS4_N_EMBD * sizeof(float));
+        hc_pre_from_state_one_scratch(&e->model,
+                                      lw->hc_attn_fn,
+                                      lw->hc_attn_scale,
+                                      lw->hc_attn_base,
+                                      scratch->attn_residual, scratch->attn_cur, post, comb,
+                                      scratch->hc_flat,
+                                      false);
+
+        layer_attn_norm_one(scratch->attn_norm, &e->model, lw, scratch->attn_cur);
+        const uint32_t ratio = cache->compress_ratio;
+        layer_q_projection_with_lora_one_decode_scratch(&e->model, lw,
+                                                        scratch->attn_norm,
+                                                        scratch->q,
+                                                        scratch->qr_norm,
+                                                        scratch);
+        layer_kv_projection_normed_one_decode_scratch(&e->model, lw,
+                                                      scratch->attn_norm,
+                                                      scratch->kv,
+                                                      scratch);
+
+        rope_tail_layer_inplace(scratch->q, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                DS4_N_ROT, pos, il, false);
+        rope_tail_layer_inplace(scratch->kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                                DS4_N_ROT, pos, il, false);
+        dsv4_fp8_kv_quantize_row_inplace_cpu(scratch->kv, DS4_N_HEAD_DIM, DS4_N_ROT);
+        kv_cache_push_raw(cache, scratch->kv);
+
+        bool *comp_allowed = NULL;
+        if (ratio != 0) {
+            if (compressor_decode_one_decode_scratch(scratch->comp, &e->model,
+                                                     lw->attn_compressor_kv,
+                                                     lw->attn_compressor_gate,
+                                                     lw->attn_compressor_ape,
+                                                     lw->attn_compressor_norm,
+                                                     scratch->attn_norm,
+                                                     cache->attn_state_kv,
+                                                     cache->attn_state_score,
+                                                     DS4_N_HEAD_DIM,
+                                                     ratio, il, pos, scratch)) {
+                kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp,
+                                   cache->comp_cap, DS4_N_HEAD_DIM, scratch->comp);
+            }
+            if (ratio == 4) {
+                if (compressor_decode_one_decode_scratch(scratch->index_comp, &e->model,
+                                                         lw->indexer_compressor_kv,
+                                                         lw->indexer_compressor_gate,
+                                                         lw->indexer_compressor_ape,
+                                                         lw->indexer_compressor_norm,
+                                                         scratch->attn_norm,
+                                                         cache->index_state_kv,
+                                                         cache->index_state_score,
+                                                         DS4_N_INDEXER_HEAD_DIM,
+                                                         ratio, il, pos, scratch)) {
+                    kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp,
+                                       cache->comp_cap,
+                                       DS4_N_INDEXER_HEAD_DIM, scratch->index_comp);
+                }
+            }
+        }
+        if (ratio == 4) {
+            comp_allowed = indexer_allowed_decode_one_decode_scratch(&e->model, lw,
+                                                                     scratch->attn_norm,
+                                                                     scratch->qr_norm,
+                                                                     cache->index_comp_kv,
+                                                                     cache->n_index_comp,
+                                                                     il, pos, scratch);
+        }
+
+        if (ratio != 0) {
+            layer_attention_mixed_one_decode_scratch(scratch->heads, &e->model, lw,
+                                                     scratch->q,
+                                                     cache->raw_kv, cache->n_raw,
+                                                     cache->attn_comp_kv, cache->n_comp,
+                                                     comp_allowed, scratch);
+        } else {
+            layer_attention_rows_one(scratch->heads, &e->model, lw, scratch->q,
+                                     cache->raw_kv, cache->n_raw);
+        }
+
+        rope_tail_layer_inplace(scratch->heads, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                DS4_N_ROT, pos, il, true);
+        layer_grouped_out_one_decode_scratch(scratch->attn_out, &e->model, lw,
+                                             scratch->heads, scratch);
+        hc_post_one(scratch->after_attn_hc, scratch->attn_out,
+                    scratch->attn_residual, post, comb, DS4_N_EMBD, n_hc);
+
+        /* ---- 2. Xeon FFN (replaces layer_ffn_one_decode_scratch) ---- */
+        hc_pre_from_state_one_scratch(&e->model,
+                                      lw->hc_ffn_fn,
+                                      lw->hc_ffn_scale,
+                                      lw->hc_ffn_base,
+                                      scratch->after_attn_hc,
+                                      scratch->ffn_cur, post, comb,
+                                      scratch->hc_flat,
+                                      false);
+        ds4_xeon_rms_norm(scratch->ffn_norm, scratch->ffn_cur,
+                          (const float*)tensor_data(&e->model, lw->ffn_norm), DS4_N_EMBD, 1e-6f);
+
+        /* Router: select top-k experts */
+        int32_t selected[DS4_N_EXPERT_USED];
+        float   expert_weights[DS4_N_EXPERT_USED];
+        if (lw->ffn_gate_tid2eid) {
+            layer_hash_selected_experts(selected, &e->model, lw, token);
+            layer_hash_router_weights_one(expert_weights, &e->model, lw,
+                                          scratch->ffn_norm, selected);
+        } else {
+            layer_topk_selected_experts(selected, expert_weights,
+                                        &e->model, lw, scratch->ffn_norm);
+        }
+
+        /* pre-dequant done at top of loop */
+
+        /* Xeon VNNI FFN */
+        int buf = pre->current_buf;
+        ds4_xeon_ffn_decode_one(scratch->ffn_moe,
+                                scratch->ffn_norm,
+                                pre->gate_up[buf],
+                                pre->gate_up[buf], /* same buffer: gate at eid*2, up at eid*2+1 */
+                                pre->down[buf],
+                                selected, expert_weights,
+                                DS4_N_EMBD, DS4_N_FF_EXP);
+
+        /* Shared FFN (CPU path — small, keep for correctness) */
+        layer_shared_ffn_one_decode_scratch(scratch->ffn_shared, &e->model, lw,
+                                            scratch->ffn_norm, scratch);
+        for (int i = 0; i < DS4_N_EMBD; i++)
+            scratch->ffn_out[i] = scratch->ffn_moe[i] + scratch->ffn_shared[i];
+
+        hc_post_one(scratch->next, scratch->ffn_out, scratch->after_attn_hc,
+                    post, comb, DS4_N_EMBD, n_hc);
+
+        /* swap cur/next for next layer */
+        { float *tmp = scratch->cur; scratch->cur = scratch->next; scratch->next = tmp; }
+    }
+
+    /* LM head */
+    output_logits_one_decode_scratch(logits, &e->model, &e->weights,
+                                     scratch->cur, scratch);
+}
+
 /* Xeon version of the high-level generation loop. */
 static int generate_xeon_graph_raw_swa(
         const ds4_model   * model,
@@ -18326,8 +18507,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_HC,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_N_LAYER,
                 -1 /* numa interleaved */);
-            // Pre-dequant disabled: using instant matvec path instead
-            // ds4_xeon_predequant_init(&s->predequant, NULL, ...);
+            ds4_xeon_predequant_init(&s->predequant, &e->weights,
+                DS4_N_LAYER, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            /* Pre-dequant deferred: 256 experts × 43 layers ~5 min startup.
+             * For now, decode uses on-the-fly MoE.  Pre-dequant will be
+             * enabled once expert-level lazy loading is implemented (Phase F). */
+            (void)s->predequant; // unused for now
         }
 #endif
         *out = s;
@@ -18376,6 +18561,7 @@ void ds4_session_free(ds4_session *s) {
 #if defined(__x86_64__)
         if (s->engine && s->engine->backend == DS4_BACKEND_XEON) {
             ds4_xeon_graph_free(&s->xeon_graph);
+            ds4_xeon_predequant_weights_free(&s->predequant);
             // ds4_xeon_predequant_weights_free(&s->predequant);
         }
 #endif
@@ -18447,13 +18633,18 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         {
             s->mtp_draft_valid = false;
             for (int i = s->checkpoint.len; i < prompt->len; i++) {
-                forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                    &e->model, &e->weights, &s->cpu_cache,
-                    prompt->v[i], (uint32_t)s->checkpoint.len,
-                    e->directional_steering_dirs,
-                    e->directional_steering_attn_scale,
-                    e->directional_steering_ffn_scale,
-                    &s->cpu_scratch);
+                if (s->predequant.gate_up[0]) {
+                    ds4_xeon_decode_token(s->logits, e, s,
+                        prompt->v[i], (uint32_t)i);
+                } else {
+                    forward_token_raw_swa_cpu_decode_scratch(s->logits,
+                        &e->model, &e->weights, &s->cpu_cache,
+                        prompt->v[i], (uint32_t)s->checkpoint.len,
+                        e->directional_steering_dirs,
+                        e->directional_steering_attn_scale,
+                        e->directional_steering_ffn_scale,
+                        &s->cpu_scratch);
+                }
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
             }

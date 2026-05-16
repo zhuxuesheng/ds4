@@ -1148,6 +1148,140 @@ void ds4_xeon_swiglu(float *out, const float *x, const float *y, int n) {
     }
 }
 
+// ============================================================================
+// VNNI Matvec — single-core row-range functions (caller parallelizes via pool)
+// ============================================================================
+
+/* VPDPBUSD matvec: INT8 activation × uint8 pre-dequant weight → float[out_dim].
+ * Processes rows [row0, row1).  Caller uses ds4_parallel_for to parallelize
+ * across rows.  in_dim must be a multiple of 64. */
+void ds4_xeon_matvec_vpdpbusd(float *out, const int8_t *a8,
+    const uint8_t *w8, int in_dim, int row0, int row1)
+{
+    int n_blocks = in_dim / 64;
+    for (int r = row0; r < row1; r++) {
+        const uint8_t *wr = w8 + (uint64_t)r * in_dim;
+        __m512i acc = _mm512_setzero_si512();
+        for (int b = 0; b < n_blocks; b++) {
+            int off = b * 64;
+            __m512i av = _mm512_loadu_si512((const __m512i*)(a8 + off));
+            __m512i wv = _mm512_loadu_si512((const __m512i*)(wr + off));
+            acc = _mm512_dpbusd_epi32(acc, wv, av);
+        }
+        out[r] = (float)_mm512_reduce_add_epi32(acc);
+    }
+}
+
+/* VPDPWSSD matvec: INT16 activation × int16 pre-dequant weight → float[out_dim].
+ * Processes rows [row0, row1).  in_dim must be a multiple of 32. */
+void ds4_xeon_matvec_vpdpwssd(float *out, const int16_t *a16,
+    const int16_t *w16, int in_dim, int row0, int row1)
+{
+    int n_blocks = in_dim / 32;
+    for (int r = row0; r < row1; r++) {
+        const int16_t *wr = w16 + (uint64_t)r * in_dim;
+        __m512i acc = _mm512_setzero_si512();
+        for (int b = 0; b < n_blocks; b++) {
+            int off = b * 32;
+            __m512i av = _mm512_loadu_si512((const __m512i*)(a16 + off));
+            __m512i wv = _mm512_loadu_si512((const __m512i*)(wr + off));
+            acc = _mm512_dpwssd_epi32(acc, wv, av);
+        }
+        out[r] = (float)_mm512_reduce_add_epi32(acc);
+    }
+}
+
+/* Parallel-for context structs for FFN matvec dispatch */
+typedef struct {
+    float *out;
+    const int8_t *a8;
+    const uint8_t *w8;
+    int in_dim;
+} matvec_vpdpbusd_ctx;
+
+static void matvec_vpdpbusd_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_vpdpbusd_ctx *ctx = (matvec_vpdpbusd_ctx*)vctx;
+    ds4_xeon_matvec_vpdpbusd(ctx->out, ctx->a8, ctx->w8,
+        ctx->in_dim, (int)row0, (int)row1);
+}
+
+typedef struct {
+    float *out;
+    const int16_t *a16;
+    const int16_t *w16;
+    int in_dim;
+} matvec_vpdpwssd_ctx;
+
+static void matvec_vpdpwssd_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_vpdpwssd_ctx *ctx = (matvec_vpdpwssd_ctx*)vctx;
+    ds4_xeon_matvec_vpdpwssd(ctx->out, ctx->a16, ctx->w16,
+        ctx->in_dim, (int)row0, (int)row1);
+}
+
+/* Single token, single layer FFN using pre-dequantized weights + VNNI.
+ * x:       [n_embd] RMS-normed input
+ * out:     [n_embd] output accumulator (zeroed first, then accumulated)
+ * pre:     pointer to pre-dequantized weight buffers for this layer
+ * selected:[n_expert_used] expert indices from router
+ * weights: [n_expert_used] router weights
+ * n_embd, n_ff_exp: model dimensions */
+void ds4_xeon_ffn_decode_one(
+    float *restrict out,
+    const float *restrict x,
+    const uint8_t *gate_u8,
+    const uint8_t *up_u8,
+    const int16_t *down_i16,
+    const int32_t *selected,
+    const float *expert_weights,
+    int n_embd, int n_ff_exp)
+{
+    /* quantize input to INT8 per-block (block_size=64) */
+    int8_t *a8 = (int8_t*)aligned_alloc(64, (size_t)n_embd);
+    float  *a8_sc = (float*)aligned_alloc(64, (size_t)(n_embd / 64) * sizeof(float));
+    ds4_xeon_quantize_a8_per_block(a8, a8_sc, x, 1, n_embd, 64);
+
+    memset(out, 0, (size_t)n_embd * sizeof(float));
+
+    for (int e = 0; e < DS4_N_EXPERT_USED; e++) {
+        int eid = selected[e];
+        float ew = expert_weights[e];
+        /* gate/up are interleaved: gate at [eid*2], up at [eid*2+1] */
+        uint64_t expert_off_gate = (uint64_t)eid * 2 * (uint64_t)n_ff_exp * (uint64_t)n_embd;
+        uint64_t expert_off_up   = expert_off_gate + (uint64_t)n_ff_exp * (uint64_t)n_embd;
+        uint64_t expert_off_down = (uint64_t)eid * (uint64_t)n_embd * (uint64_t)n_ff_exp;
+
+        float *gate = (float*)aligned_alloc(64, (size_t)n_ff_exp * sizeof(float));
+        float *up   = (float*)aligned_alloc(64, (size_t)n_ff_exp * sizeof(float));
+        float *mid  = (float*)aligned_alloc(64, (size_t)n_ff_exp * sizeof(float));
+        float *down = (float*)aligned_alloc(64, (size_t)n_embd * sizeof(float));
+
+        /* gate + up: VPDPBUSD matvecs */
+        ds4_xeon_matvec_vpdpbusd(gate, a8,
+            gate_u8 + expert_off_gate, n_embd, 0, n_ff_exp);
+        ds4_xeon_matvec_vpdpbusd(up, a8,
+            up_u8 + expert_off_up, n_embd, 0, n_ff_exp);
+
+        /* SwiGLU */
+        ds4_xeon_swiglu(mid, gate, up, n_ff_exp);
+
+        /* quantize mid to INT16 */
+        int16_t *a16 = (int16_t*)aligned_alloc(64, (size_t)n_ff_exp * sizeof(int16_t));
+        float a16_sc;
+        ds4_xeon_quantize_a16_per_token(a16, &a16_sc, mid, 1, n_ff_exp);
+
+        /* down: VPDPWSSD matvec */
+        ds4_xeon_matvec_vpdpwssd(down, a16,
+            down_i16 + expert_off_down, n_ff_exp, 0, n_embd);
+
+        /* accumulate weighted output */
+        for (int i = 0; i < n_embd; i++)
+            out[i] += down[i] * ew;
+
+        free(down); free(mid); free(up); free(gate); free(a16);
+    }
+    free(a8_sc); free(a8);
+}
+
 #else
 // No-AVX512 stubs for platforms that lack VNNI support
 void ds4_xeon_matmul_a8w8_vnni(float *o, const int8_t *a8, const float *as,

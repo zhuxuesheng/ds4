@@ -217,6 +217,28 @@ void ds4_xeon_graph_init(ds4_xeon_graph *g, uint32_t max_batch_size,
     int numa_node);
 void ds4_xeon_graph_free(ds4_xeon_graph *g);
 
+// === VNNI Matvec (row-range, for caller-side thread-pool dispatch) ===
+
+// VPDPBUSD: INT8 activation × uint8 weight → float, rows [row0,row1)
+void ds4_xeon_matvec_vpdpbusd(float *out, const int8_t *a8,
+    const uint8_t *w8, int in_dim, int row0, int row1);
+
+// VPDPWSSD: INT16 activation × int16 weight → float, rows [row0,row1)
+void ds4_xeon_matvec_vpdpwssd(float *out, const int16_t *a16,
+    const int16_t *w16, int in_dim, int row0, int row1);
+
+// Single token, single layer FFN using pre-dequant weights + VNNI matmuls.
+// Caller must have pre-dequantized gate/up/down weights for this layer.
+void ds4_xeon_ffn_decode_one(
+    float *restrict out,
+    const float *restrict x,
+    const uint8_t *gate_u8,
+    const uint8_t *up_u8,
+    const int16_t *down_i16,
+    const int32_t *selected,
+    const float *expert_weights,
+    int n_embd, int n_ff_exp);
+
 // === High-Level Graph Execution ===
 
 bool ds4_xeon_graph_prefill(
