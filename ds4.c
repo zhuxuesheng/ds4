@@ -716,10 +716,6 @@ static void ds4_threads_init(void) {
 
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
 
-#if defined(__x86_64__)
-    ds4_xeon_threads_init();
-#endif
-
     uint32_t n_threads = 12;
     const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     if (online_cpus > 0) {
@@ -18162,6 +18158,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
+#if defined(__x86_64__)
+    if (e->backend == DS4_BACKEND_XEON) {
+        ds4_xeon_threads_init();
+    }
+#endif
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
