@@ -950,7 +950,9 @@ typedef struct {
 
 typedef struct {
     int fd;
+    int fd_alt;             // second fd for NUMA-local mapping (xeon only)
     const uint8_t *map;
+    const uint8_t *map_alt; // second mmap for socket 1 local access (xeon)
     uint64_t size;
 
     uint32_t version;
@@ -18161,6 +18163,25 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #if defined(__x86_64__)
     if (e->backend == DS4_BACKEND_XEON) {
         ds4_xeon_threads_init();
+        // T4.2.2: second NUMA-local mmap for socket 1
+        int fd2 = open(opt->model_path, O_RDONLY);
+        if (fd2 >= 0) {
+            e->model.fd_alt = fd2;
+            e->model.map_alt = mmap(NULL, (size_t)e->model.size,
+                PROT_READ, MAP_SHARED, fd2, 0);
+            if (e->model.map_alt == MAP_FAILED) {
+                e->model.map_alt = NULL;
+                close(fd2); e->model.fd_alt = -1;
+            } else {
+                // Bind second mapping to NUMA node 1
+                unsigned long nmask = 2UL;  // node 1
+                long rc = syscall(237 /* SYS_mbind on x86_64 */,
+                    e->model.map_alt, e->model.size,
+                    2 /* MPOL_BIND */, &nmask, 64, 1 /* MPOL_MF_MOVE */);
+                fprintf(stderr, "ds4: dual-mmap NUMA replica ready (socket 0+1, mbind=%ld)\n", rc);
+                ds4_xeon_set_numa_maps(e->model.map, e->model.map_alt);
+            }
+        }
     }
 #endif
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {

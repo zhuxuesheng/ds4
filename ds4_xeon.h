@@ -232,6 +232,11 @@ void ds4_xeon_threads_bind(int numa_node);
 // Initialize threads (legacy, delegates to bind with numa_node=0).
 void ds4_xeon_threads_init(void);
 
+// NUMA-local tensor data: returns model->map_alt + offset for node 1,
+// model->map + offset for node 0. Set map pointers via ds4_xeon_set_numa_maps.
+void ds4_xeon_set_numa_maps(const uint8_t *map0, const uint8_t *map1);
+const uint8_t *ds4_xeon_tensor_data_numa(uint64_t abs_offset);
+
 // === Weight Pre-dequantization ===
 
 // Dequantize a single IQ2XXS block (66 bytes → 256 uint8).

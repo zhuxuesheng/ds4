@@ -942,6 +942,27 @@ void ds4_xeon_rms_norm(float *out, const float *in, const float *w, int n, float
 }
 
 // ============================================================================
+// NUMA-local tensor data access (T4.2.2)
+// ============================================================================
+static const uint8_t *g_numa_map[2] = {NULL, NULL};
+
+void ds4_xeon_set_numa_maps(const uint8_t *map0, const uint8_t *map1) {
+    g_numa_map[0] = map0;
+    g_numa_map[1] = map1;
+}
+
+const uint8_t *ds4_xeon_tensor_data_numa(uint64_t abs_offset) {
+    int node = 0;
+#ifdef __linux__
+    int cpu = sched_getcpu();
+    // Quick NUMA node lookup: on dual-socket Ice Lake, CPUs 0-23 → node 0, 24-47 → node 1
+    node = (cpu >= 24) ? 1 : 0;
+#endif
+    const uint8_t *map = g_numa_map[node] ? g_numa_map[node] : g_numa_map[0];
+    return map + abs_offset;
+}
+
+// ============================================================================
 // Xeon Routed MoE — AVX-512 instant matvec per expert
 // ============================================================================
 // Process one token through one expert: gate → up → SiLU → down → accumulate.

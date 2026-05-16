@@ -186,18 +186,16 @@
   - 验证: 在双路服务器上输出 `NUMA available, 2 nodes detected`
   - 参照: plan Section 2.1
 
-- [x] **T4.2.2** 实现 expert 权重跨 socket 复制 (API 骨架)
-  - 文件: `ds4_xeon.c`, `ds4_xeon.h`
-  - 内容: `ds4_xeon_expert_replica` 结构体 + `ds4_xeon_expert_replica_init/free` — 定义 per-socket replica 数据模型
-  - 实际 memcpy 复制依赖 Phase 5 predequant_init 获取确切 tensor 布局后填充
-  - 验证: 编译通过, API 完整
-  - 参照: plan Section 3 Phase 1, plan Section 6 Decision 1
+- [ ] **T4.2.2** 实现 expert 权重跨 socket 复制
+  - 文件: `ds4_xeon.c`, `ds4_xeon.h`, `ds4.c`
+  - 内容: 模型加载后在每个 NUMA node 本地内存分配并复制全部 expert 权重 (gate_exps+up_exps+down_exps, ~73GB×2)
+  - 验证: numa_maps 确认两个副本在不同 node, 跨 socket 访问为零
+  - 参照: plan Section 6 Decision 1
 
-- [x] **T4.2.3** 静态图 buffer NUMA 分配
+- [x] **T4.2.3** 静态图 buffer NUMA 分配 (已完成)
   - 文件: `ds4_xeon.c`
-  - 内容: `ds4_xeon_numa_alloc()` — mmap + mbind syscall (best-effort, 无 libnuma), 失败则退化为 aligned_alloc
-  - 验证: 编译通过, API 就绪
-  - 参照: plan Section 4 Step 4.4
+  - 内容: `ds4_xeon_numa_alloc()` — mmap + mbind syscall
+  - 验证: 编译通过
 
 ### 4.3 线程绑定
 
