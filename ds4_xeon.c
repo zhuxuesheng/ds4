@@ -1157,11 +1157,11 @@ void ds4_xeon_swiglu(float *out, const float *x, const float *y, int n) {
 // Used for attention Q/KV/Output projections in the xeon decode path.
 void ds4_xeon_q80_matvec(float *out,
     const int16_t *act_i16, float act_scale,
-    const void *q80_blocks,  /* block_q8_0[]: int8[32]+float per block */
+    const void *q80_blocks,  /* block_q8_0[]: int8[32]+fp16 per block */
     int in_dim, int out_dim)
 {
     int n_blocks = in_dim / 32;
-    int block_stride = 36; /* sizeof(block_q8_0) = 32 qs + 4 d */
+    int block_stride = 34; /* sizeof(block_q8_0) = 32 qs + 2 fp16 */
     const int8_t *base = (const int8_t*)q80_blocks;
 
     for (int r = 0; r < out_dim; r++) {
@@ -1169,7 +1169,7 @@ void ds4_xeon_q80_matvec(float *out,
         float total = 0.0f;
         for (int b = 0; b < n_blocks; b++) {
             const int8_t *blk = row_blocks + b * block_stride;
-            float d = *(const float*)(blk + 32);
+            float d = xeon_f16_to_f32(*(const uint16_t*)(blk + 32));
             __m256i w8 = _mm256_loadu_si256((const __m256i*)blk);
             __m512i w16 = _mm512_cvtepi8_epi16(w8);
             __m512i a16 = _mm512_loadu_si512((const __m512i*)(act_i16 + b * 32));
@@ -1186,7 +1186,7 @@ void ds4_xeon_q80_matvec_rows(float *out,
     const void *q80_blocks, int in_dim, int row0, int row1)
 {
     int n_blocks = in_dim / 32;
-    int block_stride = 36;
+    int block_stride = 34; /* sizeof(block_q8_0) = 32 qs + 2 fp16 */
     const int8_t *base = (const int8_t*)q80_blocks;
 
     for (int r = row0; r < row1; r++) {
@@ -1194,7 +1194,7 @@ void ds4_xeon_q80_matvec_rows(float *out,
         float total = 0.0f;
         for (int b = 0; b < n_blocks; b++) {
             const int8_t *blk = row_blocks + b * block_stride;
-            float d = *(const float*)(blk + 32);
+            float d = xeon_f16_to_f32(*(const uint16_t*)(blk + 32));
             __m256i w8 = _mm256_loadu_si256((const __m256i*)blk);
             __m512i w16 = _mm512_cvtepi8_epi16(w8);
             __m512i a16 = _mm512_loadu_si512((const __m512i*)(act_i16 + b * 32));
