@@ -953,6 +953,7 @@ typedef struct {
     int fd_alt;             // second fd for NUMA-local mapping (xeon only)
     const uint8_t *map;
     const uint8_t *map_alt; // second mmap for socket 1 local access (xeon)
+    bool numa_maps;         // when true, tensor_data picks map vs map_alt by cpu
     uint64_t size;
 
     uint32_t version;
@@ -1508,7 +1509,14 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 
 /* Return the in-place tensor payload inside the mapped GGUF. */
 static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
-    return m->map + t->abs_offset;
+    const uint8_t *map = m->map;
+#if defined(__x86_64__)
+    if (m->numa_maps && m->map_alt) {
+        int cpu = sched_getcpu();
+        if (cpu >= 24) map = m->map_alt;  // socket 1
+    }
+#endif
+    return map + t->abs_offset;
 }
 
 /* Optional startup pass that touches tensor pages before timing generation. */
@@ -16590,20 +16598,23 @@ static void prefill_xeon_graph(
     }
     free(plain);
 
+    // T4.2.2: enable NUMA-local weight access for FFN expert tensors
+    e->model.numa_maps = true;
+
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         fprintf(stderr, "ds4: xeon prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
         fflush(stderr);
 
         const ds4_layer_weights *lw = &e->weights.layer[il];
 
-        // 1. Attention (CPU path)
+        // 1. Attention (CPU path—attention weights are small, cross-socket OK)
         layer_attention_raw_swa_batch(next_f32,
             &e->model, lw, &s->cpu_cache.layer[il],
             cur_f32, (uint32_t)n_tok, il, 0,
             e->directional_steering_dirs,
             e->directional_steering_attn_scale);
 
-        // 2. FFN (CPU AVX-512 path — already optimized via ds4_op.c merge)
+        // 2. FFN (NUMA-local expert weights via tensor_data numa_maps)
         layer_ffn_batch(cur_f32,
                         &e->model,
                         lw,
@@ -16614,6 +16625,8 @@ static void prefill_xeon_graph(
                         e->directional_steering_dirs,
                         e->directional_steering_ffn_scale);
     }
+
+    e->model.numa_maps = false;  // restore default for non-FFN tensor access
 
     kv_cache_finish_prefill_states(&s->cpu_cache, (uint32_t)n_tok);
     if (logits) {

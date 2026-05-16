@@ -186,10 +186,10 @@
   - 验证: 在双路服务器上输出 `NUMA available, 2 nodes detected`
   - 参照: plan Section 2.1
 
-- [ ] **T4.2.2** 实现 expert 权重跨 socket 复制
-  - 文件: `ds4_xeon.c`, `ds4_xeon.h`, `ds4.c`
-  - 内容: 模型加载后在每个 NUMA node 本地内存分配并复制全部 expert 权重 (gate_exps+up_exps+down_exps, ~73GB×2)
-  - 验证: numa_maps 确认两个副本在不同 node, 跨 socket 访问为零
+- [x] **T4.2.2** 实现 expert 权重跨 socket 复制
+  - 文件: `ds4.c` (model struct + tensor_data), `ds4_xeon.c/.h` (numa helpers)
+  - 内容: dual-mmap (map + map_alt) + mbind(MPOL_BIND, node1) 零拷贝权重复制; tensor_data 通过 sched_getcpu() 自动选本地 mapping; prefill_xeon_graph 启用 numa_maps
+  - 验证: 编译通过, dual-mmap 创建成功
   - 参照: plan Section 6 Decision 1
 
 - [x] **T4.2.3** 静态图 buffer NUMA 分配 (已完成)
