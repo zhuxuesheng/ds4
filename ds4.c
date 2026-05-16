@@ -16692,9 +16692,32 @@ static void ds4_xeon_decode_token(
         int                 token,
         uint32_t            pos)
 {
+    /* Delegate to CPU path for correctness baseline.
+     * VNNI optimizations will be incrementally added:
+     *   Step 1: Replace MoE FFN with VNNI (verify correctness)
+     *   Step 2: Replace attention Q/KV with VNNI (verify correctness)
+     *   Step 3: Add ds4_parallel_for parallelism (verify speed) */
+    forward_token_raw_swa_cpu_decode_scratch(logits,
+        &e->model, &e->weights, &s->cpu_cache,
+        token, pos,
+        e->directional_steering_dirs,
+        e->directional_steering_attn_scale,
+        e->directional_steering_ffn_scale,
+        &s->cpu_scratch);
+}
+
+/* Original xeon per-layer implementation kept as reference for VNNI migration.
+ * Remove when migration is complete and verified. */
+#if 0
+static void ds4_xeon_decode_token_vnni(
+        float             * logits,
+        ds4_engine        * e,
+        ds4_session       * s,
+        int                 token,
+        uint32_t            pos)
+{
     ds4_cpu_decode_scratch *scratch = &s->cpu_scratch;
 
-    /* embedding → HC init */
     embed_token_f16(&e->model, &e->weights, token, scratch->plain);
     hc_from_plain_embedding(scratch->cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
 
@@ -16703,7 +16726,6 @@ static void ds4_xeon_decode_token(
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *lw = &e->weights.layer[il];
         ds4_layer_cache *cache = &s->cpu_cache.layer[il];
-
         /* ---- 1. CPU Attention (same as layer_forward_raw_swa_one) ---- */
         float post[4], comb[16];
 
@@ -16938,6 +16960,7 @@ static void ds4_xeon_decode_token(
     output_logits_one_decode_scratch(logits, &e->model, &e->weights,
                                      scratch->cur, scratch);
 }
+#endif /* 0 — original VNNI implementation, reference for migration */
 
 /* Xeon version of the high-level generation loop. */
 static int generate_xeon_graph_raw_swa(
@@ -19060,16 +19083,24 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     if (!s) return 1;
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
-        forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                 &e->model,
-                                                 &e->weights,
-                                                 &s->cpu_cache,
-                                                 token,
-                                                 (uint32_t)s->checkpoint.len,
-                                                 e->directional_steering_dirs,
-                                                 e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
-                                                 &s->cpu_scratch);
+#if defined(__x86_64__)
+        if (e->backend == DS4_BACKEND_XEON) {
+            ds4_xeon_decode_token(s->logits, e, s, token,
+                                  (uint32_t)s->checkpoint.len);
+        } else
+#endif
+        {
+            forward_token_raw_swa_cpu_decode_scratch(s->logits,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     &s->cpu_cache,
+                                                     token,
+                                                     (uint32_t)s->checkpoint.len,
+                                                     e->directional_steering_dirs,
+                                                     e->directional_steering_attn_scale,
+                                                     e->directional_steering_ffn_scale,
+                                                     &s->cpu_scratch);
+        }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
