@@ -980,14 +980,13 @@ void ds4_xeon_routed_moe_one_expert(
     uint64_t down_row_bytes,       // bytes per down output row
     float expert_weight)           // router weight for this expert
 {
-    // Pre-allocated buffers (from graph, avoids malloc in hot loop)
-    // Using static for now; TODO: use ds4_xeon_graph buffers for thread safety
-    __attribute__((aligned(64))) static int16_t act_i16[DS4_N_EMBD];
-    __attribute__((aligned(64))) static float  gate[DS4_N_FF_EXP];
-    __attribute__((aligned(64))) static float  up[DS4_N_FF_EXP];
-    __attribute__((aligned(64))) static float  mid[DS4_N_FF_EXP];
-    __attribute__((aligned(64))) static int16_t mid_i16[DS4_N_FF_EXP];
-    __attribute__((aligned(64))) static int32_t mid_sums[DS4_N_FF_EXP / 32];
+    // Stack buffers (~50 KB total, well within default 8 MB stack)
+    __attribute__((aligned(64))) int16_t act_i16[DS4_N_EMBD];
+    __attribute__((aligned(64))) float  gate[DS4_N_FF_EXP];
+    __attribute__((aligned(64))) float  up[DS4_N_FF_EXP];
+    __attribute__((aligned(64))) float  mid[DS4_N_FF_EXP];
+    __attribute__((aligned(64))) int16_t mid_i16[DS4_N_FF_EXP];
+    __attribute__((aligned(64))) int32_t mid_sums[DS4_N_FF_EXP / 32];
 
     // Quantize input to int16 for IQ2XXS dot products
     float act_scale;
@@ -1051,7 +1050,9 @@ void ds4_xeon_attn_scores(
 {
     (void)il;
     const float attn_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    float *scores_buf = (float*)aligned_alloc(64, (size_t)n_tok * sizeof(float));
+    /* Round up to 16 to avoid _mm512_storeu_ps writing past allocation */
+    size_t buf_elems = ((size_t)n_tok + 15) & ~(size_t)15;
+    float *scores_buf = (float*)aligned_alloc(64, buf_elems * sizeof(float));
 
     for (uint32_t t = 0; t < n_tok; t++) {
         const float *qt = q + (uint64_t)t * DS4_N_HEAD * DS4_N_HEAD_DIM;

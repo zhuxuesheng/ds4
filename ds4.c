@@ -16646,7 +16646,6 @@ static void ds4_xeon_decode_token(
         uint32_t            pos)
 {
     ds4_cpu_decode_scratch *scratch = &s->cpu_scratch;
-    ds4_xeon_predequant_weights *pre = &s->predequant;
 
     /* embedding → HC init */
     embed_token_f16(&e->model, &e->weights, token, scratch->plain);
@@ -16657,18 +16656,6 @@ static void ds4_xeon_decode_token(
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *lw = &e->weights.layer[il];
         ds4_layer_cache *cache = &s->cpu_cache.layer[il];
-
-        /* Lazy pre-dequant this layer (double-buffered: ping-pong) */
-        if (pre->gate_up[0]) {
-            int buf = il & 1;  /* ping-pong: layer 0→buf0, 1→buf1, 2→buf0, ... */
-            pre->current_buf = buf;
-            /* only dequant if not already cached */
-            if (pre->cached_layer[buf] != (int)il) {
-                pre->cached_layer[buf] = (int)il;
-                for (int eid = 0; eid < DS4_N_EXPERT; eid++)
-                    ds4_xeon_predequant_expert(pre, &e->model, lw, eid);
-            }
-        }
 
         /* ---- 1. CPU Attention (same as layer_forward_raw_swa_one) ---- */
         float post[4], comb[16];
@@ -16785,19 +16772,26 @@ static void ds4_xeon_decode_token(
                                         &e->model, lw, scratch->ffn_norm);
         }
 
-        /* pre-dequant done at top of loop */
+        /* On-the-fly MoE: ds4_xeon_routed_moe_one_expert per selected expert */
+        memset(scratch->ffn_moe, 0, (size_t)DS4_N_EMBD * sizeof(float));
+        for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
+            int eid = selected[ei];
+            uint64_t gate_idim, gate_odim, gate_rb;
+            uint64_t up_idim,   up_odim,   up_rb;
+            uint64_t down_idim, down_odim, down_rb;
+            const uint8_t *gate_raw = tensor_expert_bytes(&e->model,
+                lw->ffn_gate_exps, (uint32_t)eid, &gate_idim, &gate_odim, &gate_rb);
+            const uint8_t *up_raw = tensor_expert_bytes(&e->model,
+                lw->ffn_up_exps, (uint32_t)eid, &up_idim, &up_odim, &up_rb);
+            const uint8_t *down_raw = tensor_expert_bytes(&e->model,
+                lw->ffn_down_exps, (uint32_t)eid, &down_idim, &down_odim, &down_rb);
+            ds4_xeon_routed_moe_one_expert(scratch->ffn_moe,
+                scratch->ffn_norm,
+                gate_raw, up_raw, down_raw,
+                gate_rb, up_rb, down_rb, expert_weights[ei]);
+        }
 
-        /* Xeon VNNI FFN */
-        int buf = pre->current_buf;
-        ds4_xeon_ffn_decode_one(scratch->ffn_moe,
-                                scratch->ffn_norm,
-                                pre->gate_up[buf],
-                                pre->gate_up[buf], /* same buffer: gate at eid*2, up at eid*2+1 */
-                                pre->down[buf],
-                                selected, expert_weights,
-                                DS4_N_EMBD, DS4_N_FF_EXP);
-
-        /* Shared FFN (CPU path — small, keep for correctness) */
+        /* Shared FFN (CPU path) */
         layer_shared_ffn_one_decode_scratch(scratch->ffn_shared, &e->model, lw,
                                             scratch->ffn_norm, scratch);
         for (int i = 0; i < DS4_N_EMBD; i++)
@@ -18633,18 +18627,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         {
             s->mtp_draft_valid = false;
             for (int i = s->checkpoint.len; i < prompt->len; i++) {
-                if (s->predequant.gate_up[0]) {
-                    ds4_xeon_decode_token(s->logits, e, s,
-                        prompt->v[i], (uint32_t)i);
-                } else {
-                    forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                        &e->model, &e->weights, &s->cpu_cache,
-                        prompt->v[i], (uint32_t)s->checkpoint.len,
-                        e->directional_steering_dirs,
-                        e->directional_steering_attn_scale,
-                        e->directional_steering_ffn_scale,
-                        &s->cpu_scratch);
-                }
+                ds4_xeon_decode_token(s->logits, e, s,
+                    prompt->v[i], (uint32_t)i);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
             }
