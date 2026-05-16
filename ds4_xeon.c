@@ -1046,8 +1046,8 @@ void ds4_xeon_routed_moe_one_expert(
     __attribute__((aligned(64))) float  gate[DS4_N_FF_EXP];
     __attribute__((aligned(64))) float  up[DS4_N_FF_EXP];
     __attribute__((aligned(64))) float  mid[DS4_N_FF_EXP];
-    __attribute__((aligned(64))) int16_t mid_i16[DS4_N_FF_EXP];
-    __attribute__((aligned(64))) int32_t mid_sums[DS4_N_FF_EXP / 32];
+    __attribute__((aligned(64))) int8_t  mid_q8[DS4_N_FF_EXP];
+    float   mid_q8_scale[DS4_N_FF_EXP / DS4_XEON_QK_K];
 
     // Quantize input to int16 for IQ2XXS dot products
     float act_scale;
@@ -1075,25 +1075,38 @@ void ds4_xeon_routed_moe_one_expert(
     // SwiGLU: mid = SiLU(gate) * up
     ds4_xeon_swiglu(mid, gate, up, DS4_N_FF_EXP);
 
-    // Quantize mid to int16 for Q2_K down
-    float mid_scale;
-    ds4_xeon_quantize_a16_per_token(mid_i16, &mid_scale, mid, 1, DS4_N_FF_EXP);
-    mid_scale = 1.0f / mid_scale;
-
-    // Pre-compute int32 sums for Q2_K
-    for (int i = 0; i < DS4_N_FF_EXP / 32; i++) {
-        int32_t sum = 0;
-        for (int j = 0; j < 32; j++)
-            sum += (int32_t)mid_i16[i * 32 + j];
-        mid_sums[i] = sum;
+    // Quantize mid to Q8_K per-block (matching CPU's ds4_quantize_row_q8_K).
+    // Q8_K is required for heavy-tailed SwiGLU mid; per-token INT16 loses
+    // 12.6% accuracy (see ds4_xeon_down_test.c).
+    {
+        const int nb = DS4_N_FF_EXP / DS4_XEON_QK_K;
+        for (int b = 0; b < nb; b++) {
+            const float *src = mid + b * DS4_XEON_QK_K;
+            int8_t *dst = mid_q8 + b * DS4_XEON_QK_K;
+            float amax = 1e-9f;
+            for (int i = 0; i < DS4_XEON_QK_K; i++) {
+                float a = fabsf(src[i]);
+                if (a > amax) amax = a;
+            }
+            float d = amax / 127.0f;
+            float id = 1.0f / d;
+            mid_q8_scale[b] = d;
+            for (int i = 0; i < DS4_XEON_QK_K; i++) {
+                float v = src[i] * id;
+                if (v > 127.0f) v = 127.0f;
+                if (v < -128.0f) v = -128.0f;
+                dst[i] = (int8_t)(int32_t)v;
+            }
+        }
     }
 
-    // Down projection: [DS4_N_FF_EXP] → [DS4_N_EMBD]  (4096 rows)
+    // Down projection: [DS4_N_FF_EXP] → [DS4_N_EMBD], Q8_K VNNI (0.02% error)
     for (uint32_t r = 0; r < DS4_N_EMBD; r++) {
         const ds4_xeon_block_q2_K *blocks =
             (const ds4_xeon_block_q2_K*)(down_blocks + r * down_row_bytes);
         float dot = 0.0f;
-        ds4_xeon_vec_dot_q2_K_vnni(DS4_N_FF_EXP, &dot, blocks, mid_i16, mid_sums, mid_scale);
+        ds4_xeon_vec_dot_q2_K_q8k_vnni(DS4_N_FF_EXP, &dot, blocks,
+            mid_q8, mid_q8_scale);
         out[r] += expert_weight * dot;
     }
 }
