@@ -716,10 +716,6 @@ static void ds4_threads_init(void) {
 
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
 
-#if defined(__x86_64__)
-    ds4_xeon_threads_init();
-#endif
-
     uint32_t n_threads = 12;
     const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     if (online_cpus > 0) {
