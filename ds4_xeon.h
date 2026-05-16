@@ -217,6 +217,29 @@ void ds4_xeon_graph_init(ds4_xeon_graph *g, uint32_t max_batch_size,
     int numa_node);
 void ds4_xeon_graph_free(ds4_xeon_graph *g);
 
+// === Q8_0 VNNI Matvec (OpenMP over rows, for attention projections) ===
+// Q8_0 weights: int8_t[32] + float scale per 32-element block.
+// Activation: int16_t[in_dim] with per-token scale.
+void ds4_xeon_q80_matvec(float *out,
+    const int16_t *act_i16, float act_scale,
+    const void *q80_blocks, int in_dim, int out_dim);
+
+void ds4_xeon_q80_matvec_rows(float *out,
+    const int16_t *act_i16, float act_scale,
+    const void *q80_blocks, int in_dim, int row0, int row1);
+
+// === Row-range MoE helpers (caller dispatches via ds4_parallel_for) ===
+
+void ds4_xeon_moe_gateup_rows(
+    float *out, const uint8_t *blocks, uint64_t row_bytes,
+    const int16_t *act_i16, float act_scale,
+    int row0, int row1);
+
+void ds4_xeon_moe_down_rows(
+    float *out, const uint8_t *blocks, uint64_t row_bytes,
+    const int16_t *mid_i16, const int32_t *mid_sums, float mid_scale,
+    float ew, int row0, int row1);
+
 // === VNNI Matvec (row-range, for caller-side thread-pool dispatch) ===
 
 // VPDPBUSD: INT8 activation × uint8 weight → float, rows [row0,row1)

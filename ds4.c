@@ -716,11 +716,10 @@ static void ds4_threads_init(void) {
 
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
 
-    uint32_t n_threads = 12;
+    uint32_t n_threads = 48;
     const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (online_cpus > 0) {
-        n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
-    }
+    if (online_cpus > 0 && (uint32_t)online_cpus < n_threads)
+        n_threads = (uint32_t)online_cpus;
 
     const char *env = getenv("DS4_THREADS");
     if (env && env[0]) {
@@ -16634,9 +16633,57 @@ static void prefill_xeon_graph(
     }
 }
 
+/* ==========================================================================
+   Parallel on-the-fly MoE dispatch (ds4_parallel_for over expert rows)
+   ========================================================================== */
+typedef struct {
+    float *out;
+    const uint8_t *blocks;
+    uint64_t row_bytes;
+    const int16_t *act_i16;
+    float act_scale;
+} gateup_ctx;
+
+static void gateup_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    gateup_ctx *ctx = (gateup_ctx*)vctx;
+    ds4_xeon_moe_gateup_rows(ctx->out, ctx->blocks, ctx->row_bytes,
+        ctx->act_i16, ctx->act_scale, (int)row0, (int)row1);
+}
+
+typedef struct {
+    float *out;
+    const uint8_t *blocks;
+    uint64_t row_bytes;
+    const int16_t *mid_i16;
+    const int32_t *mid_sums;
+    float mid_scale;
+    float ew;
+} down_ctx;
+
+static void down_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    down_ctx *ctx = (down_ctx*)vctx;
+    ds4_xeon_moe_down_rows(ctx->out, ctx->blocks, ctx->row_bytes,
+        ctx->mid_i16, ctx->mid_sums, ctx->mid_scale, ctx->ew,
+        (int)row0, (int)row1);
+}
+
+/* Q8_0 matvec worker context and dispatch for ds4_parallel_for */
+typedef struct {
+    float *out;
+    const int16_t *act_i16;
+    float act_scale;
+    const void *q80_blocks;
+    int in_dim;
+} q80_ctx;
+
+static void q80_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    q80_ctx *ctx = (q80_ctx*)vctx;
+    ds4_xeon_q80_matvec_rows(ctx->out, ctx->act_i16, ctx->act_scale,
+        ctx->q80_blocks, ctx->in_dim, (int)row0, (int)row1);
+}
+
 /* Xeon decode: single token through all layers.
- * Uses CPU attention (known-correct KV cache, RoPE, compressor) and
- * xeon VNNI FFN with pre-dequantized weights.
+ * CPU attention + parallel on-the-fly VNNI MoE via ds4_parallel_for.
  * This is the hot path called from ds4_session_sync for incremental decode. */
 static void ds4_xeon_decode_token(
         float             * logits,
@@ -16672,15 +16719,59 @@ static void ds4_xeon_decode_token(
 
         layer_attn_norm_one(scratch->attn_norm, &e->model, lw, scratch->attn_cur);
         const uint32_t ratio = cache->compress_ratio;
-        layer_q_projection_with_lora_one_decode_scratch(&e->model, lw,
-                                                        scratch->attn_norm,
-                                                        scratch->q,
-                                                        scratch->qr_norm,
-                                                        scratch);
-        layer_kv_projection_normed_one_decode_scratch(&e->model, lw,
-                                                      scratch->attn_norm,
-                                                      scratch->kv,
-                                                      scratch);
+
+        /* ---- VNNI Q projection (ds4_parallel_for over output rows) ---- */
+        {
+            int16_t act_i16[DS4_N_EMBD] __attribute__((aligned(64)));
+            float act_scale;
+            ds4_xeon_quantize_a16_per_token(act_i16, &act_scale,
+                scratch->attn_norm, 1, DS4_N_EMBD);
+            act_scale = 1.0f / act_scale;
+
+            /* Q down: 4096→1024 */
+            float q_down[DS4_N_LORA_Q] __attribute__((aligned(64)));
+            {
+                q80_ctx ctx = {q_down, act_i16, act_scale,
+                    tensor_data(&e->model, lw->attn_q_a), DS4_N_EMBD};
+                ds4_parallel_for_min_rows(DS4_N_LORA_Q, q80_worker, &ctx, 1);
+            }
+
+            rms_norm_weight(scratch->qr_norm, q_down,
+                (const float*)tensor_data(&e->model, lw->attn_q_a_norm),
+                DS4_N_LORA_Q, DS4_RMS_EPS);
+
+            /* Q up: 1024→32768 */
+            int16_t act_norm_i16[DS4_N_LORA_Q] __attribute__((aligned(64)));
+            float act_norm_scale;
+            ds4_xeon_quantize_a16_per_token(act_norm_i16, &act_norm_scale,
+                scratch->qr_norm, 1, DS4_N_LORA_Q);
+            act_norm_scale = 1.0f / act_norm_scale;
+            {
+                q80_ctx ctx = {scratch->q, act_norm_i16, act_norm_scale,
+                    tensor_data(&e->model, lw->attn_q_b), DS4_N_LORA_Q};
+                ds4_parallel_for_min_rows(DS4_N_HEAD * DS4_N_HEAD_DIM,
+                    q80_worker, &ctx, 1);
+            }
+
+            head_rms_norm_inplace(scratch->q, DS4_N_HEAD, DS4_N_HEAD_DIM, 1e-6f);
+        }
+
+        /* ---- VNNI KV projection (ds4_parallel_for over 512 rows) ---- */
+        {
+            int16_t act_i16[DS4_N_EMBD] __attribute__((aligned(64)));
+            float act_scale;
+            ds4_xeon_quantize_a16_per_token(act_i16, &act_scale,
+                scratch->attn_norm, 1, DS4_N_EMBD);
+            act_scale = 1.0f / act_scale;
+
+            q80_ctx ctx = {scratch->kv, act_i16, act_scale,
+                tensor_data(&e->model, lw->attn_kv), DS4_N_EMBD};
+            ds4_parallel_for_min_rows(DS4_N_HEAD_DIM, q80_worker, &ctx, 1);
+
+            rms_norm_weight(scratch->kv, scratch->kv,
+                (const float*)tensor_data(&e->model, lw->attn_kv_a_norm),
+                DS4_N_HEAD_DIM, DS4_RMS_EPS);
+        }
 
         rope_tail_layer_inplace(scratch->q, DS4_N_HEAD, DS4_N_HEAD_DIM,
                                 DS4_N_ROT, pos, il, false);
@@ -16772,10 +16863,14 @@ static void ds4_xeon_decode_token(
                                         &e->model, lw, scratch->ffn_norm);
         }
 
-        /* On-the-fly MoE: ds4_xeon_routed_moe_one_expert per selected expert */
+        /* MoE with ds4_parallel_for: row-level parallelism per expert.
+         * Each expert: gate(2048 rows) + up(2048 rows) + down(4096 rows)
+         * = 3 parallel dispatches per expert × 6 experts = 18 calls/layer.
+         * Persistent pthread pool avoids OpenMP fork/join overhead. */
         memset(scratch->ffn_moe, 0, (size_t)DS4_N_EMBD * sizeof(float));
         for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
             int eid = selected[ei];
+            float ew = expert_weights[ei];
             uint64_t gate_idim, gate_odim, gate_rb;
             uint64_t up_idim,   up_odim,   up_rb;
             uint64_t down_idim, down_odim, down_rb;
@@ -16785,10 +16880,45 @@ static void ds4_xeon_decode_token(
                 lw->ffn_up_exps, (uint32_t)eid, &up_idim, &up_odim, &up_rb);
             const uint8_t *down_raw = tensor_expert_bytes(&e->model,
                 lw->ffn_down_exps, (uint32_t)eid, &down_idim, &down_odim, &down_rb);
-            ds4_xeon_routed_moe_one_expert(scratch->ffn_moe,
-                scratch->ffn_norm,
-                gate_raw, up_raw, down_raw,
-                gate_rb, up_rb, down_rb, expert_weights[ei]);
+
+            /* Per-expert buffers */
+            float gate[DS4_N_FF_EXP] __attribute__((aligned(64)));
+            float up[DS4_N_FF_EXP]   __attribute__((aligned(64)));
+            float mid[DS4_N_FF_EXP]  __attribute__((aligned(64)));
+            int16_t act_i16[DS4_N_EMBD]       __attribute__((aligned(64)));
+            int16_t mid_i16[DS4_N_FF_EXP]     __attribute__((aligned(64)));
+            int32_t mid_sums[DS4_N_FF_EXP/32] __attribute__((aligned(64)));
+
+            /* quantize input */
+            float act_scale;
+            ds4_xeon_quantize_a16_per_token(act_i16, &act_scale,
+                scratch->ffn_norm, 1, DS4_N_EMBD);
+            act_scale = 1.0f / act_scale;
+
+            /* gate: 2048 rows via ds4_parallel_for */
+            gateup_ctx gctx = {gate, gate_raw, gate_rb, act_i16, act_scale};
+            ds4_parallel_for(DS4_N_FF_EXP, gateup_worker, &gctx);
+
+            /* up: 2048 rows via ds4_parallel_for */
+            gateup_ctx uctx = {up, up_raw, up_rb, act_i16, act_scale};
+            ds4_parallel_for(DS4_N_FF_EXP, gateup_worker, &uctx);
+
+            /* SwiGLU + quantize mid (single-core, fast) */
+            ds4_xeon_swiglu(mid, gate, up, DS4_N_FF_EXP);
+            float mid_scale;
+            ds4_xeon_quantize_a16_per_token(mid_i16, &mid_scale,
+                mid, 1, DS4_N_FF_EXP);
+            mid_scale = 1.0f / mid_scale;
+            for (int i = 0; i < DS4_N_FF_EXP / 32; i++) {
+                int32_t s = 0;
+                for (int j = 0; j < 32; j++) s += mid_i16[i*32+j];
+                mid_sums[i] = s;
+            }
+
+            /* down: 4096 rows via ds4_parallel_for, accumulates to ffn_moe */
+            down_ctx dctx = {scratch->ffn_moe, down_raw, down_rb,
+                             mid_i16, mid_sums, mid_scale, ew};
+            ds4_parallel_for(DS4_N_EMBD, down_worker, &dctx);
         }
 
         /* Shared FFN (CPU path) */

@@ -993,7 +993,7 @@ void ds4_xeon_routed_moe_one_expert(
     ds4_xeon_quantize_a16_per_token(act_i16, &act_scale, x, 1, DS4_N_EMBD);
     act_scale = 1.0f / act_scale;
 
-    // Gate projection: [DS4_N_EMBD] → [DS4_N_FF_EXP]
+    // Gate projection: [DS4_N_EMBD] → [DS4_N_FF_EXP]  (2048 rows)
     for (uint32_t r = 0; r < DS4_N_FF_EXP; r++) {
         const ds4_xeon_block_iq2_xxs *blocks =
             (const ds4_xeon_block_iq2_xxs*)(gate_blocks + r * gate_row_bytes);
@@ -1027,7 +1027,7 @@ void ds4_xeon_routed_moe_one_expert(
         mid_sums[i] = sum;
     }
 
-    // Down projection: [DS4_N_FF_EXP] → [DS4_N_EMBD]
+    // Down projection: [DS4_N_FF_EXP] → [DS4_N_EMBD]  (4096 rows)
     for (uint32_t r = 0; r < DS4_N_EMBD; r++) {
         const ds4_xeon_block_q2_K *blocks =
             (const ds4_xeon_block_q2_K*)(down_blocks + r * down_row_bytes);
@@ -1146,6 +1146,62 @@ void ds4_xeon_swiglu(float *out, const float *x, const float *y, int n) {
     for (int i = i16; i < n; i++) {
         float sx = 1.0f / (1.0f + expf(-x[i]));
         out[i] = sx * x[i] * y[i];
+    }
+}
+
+// ============================================================================
+// VNNI Q8_0 matvec — VPDPWSSD with per-block scales (OpenMP over rows)
+// ============================================================================
+// Processes Q8_0 weights (int8_t[32] + float scale per block) against
+// a single int16 activation vector.  OpenMP-parallel across output rows.
+// Used for attention Q/KV/Output projections in the xeon decode path.
+void ds4_xeon_q80_matvec(float *out,
+    const int16_t *act_i16, float act_scale,
+    const void *q80_blocks,  /* block_q8_0[]: int8[32]+float per block */
+    int in_dim, int out_dim)
+{
+    int n_blocks = in_dim / 32;
+    int block_stride = 36; /* sizeof(block_q8_0) = 32 qs + 4 d */
+    const int8_t *base = (const int8_t*)q80_blocks;
+
+    for (int r = 0; r < out_dim; r++) {
+        const int8_t *row_blocks = base + (uint64_t)r * n_blocks * block_stride;
+        float total = 0.0f;
+        for (int b = 0; b < n_blocks; b++) {
+            const int8_t *blk = row_blocks + b * block_stride;
+            float d = *(const float*)(blk + 32);
+            __m256i w8 = _mm256_loadu_si256((const __m256i*)blk);
+            __m512i w16 = _mm512_cvtepi8_epi16(w8);
+            __m512i a16 = _mm512_loadu_si512((const __m512i*)(act_i16 + b * 32));
+            __m512i acc = _mm512_dpwssd_epi32(_mm512_setzero_si512(), w16, a16);
+            total += (float)_mm512_reduce_add_epi32(acc) * d;
+        }
+        out[r] = total * act_scale;
+    }
+}
+
+/* Row-range Q8_0 matvec for ds4_parallel_for dispatch. */
+void ds4_xeon_q80_matvec_rows(float *out,
+    const int16_t *act_i16, float act_scale,
+    const void *q80_blocks, int in_dim, int row0, int row1)
+{
+    int n_blocks = in_dim / 32;
+    int block_stride = 36;
+    const int8_t *base = (const int8_t*)q80_blocks;
+
+    for (int r = row0; r < row1; r++) {
+        const int8_t *row_blocks = base + (uint64_t)r * n_blocks * block_stride;
+        float total = 0.0f;
+        for (int b = 0; b < n_blocks; b++) {
+            const int8_t *blk = row_blocks + b * block_stride;
+            float d = *(const float*)(blk + 32);
+            __m256i w8 = _mm256_loadu_si256((const __m256i*)blk);
+            __m512i w16 = _mm512_cvtepi8_epi16(w8);
+            __m512i a16 = _mm512_loadu_si512((const __m512i*)(act_i16 + b * 32));
+            __m512i acc = _mm512_dpwssd_epi32(_mm512_setzero_si512(), w16, a16);
+            total += (float)_mm512_reduce_add_epi32(acc) * d;
+        }
+        out[r] = total * act_scale;
     }
 }
 
@@ -1281,6 +1337,46 @@ void ds4_xeon_ffn_decode_one(
         free(down); free(mid); free(up); free(gate); free(a16);
     }
     free(a8_sc); free(a8);
+}
+
+// ============================================================================
+// Row-range parallel MoE helpers (caller dispatches via ds4_parallel_for)
+// ============================================================================
+
+/* Gate or Up projection: IQ2XXS dot products for rows [row0, row1).
+ * blocks: packed IQ2XXS blocks, row_bytes apart per output row.
+ * act_i16: int16 activation [DS4_N_EMBD].  act_scale: 1/quant_scale. */
+void ds4_xeon_moe_gateup_rows(
+    float *out, const uint8_t *blocks, uint64_t row_bytes,
+    const int16_t *act_i16, float act_scale,
+    int row0, int row1)
+{
+    for (int r = row0; r < row1; r++) {
+        const ds4_xeon_block_iq2_xxs *blk =
+            (const ds4_xeon_block_iq2_xxs*)(blocks + (uint64_t)r * row_bytes);
+        float dot = 0.0f;
+        ds4_xeon_vec_dot_iq2_xxs_vnni(DS4_N_EMBD, &dot, blk, act_i16, act_scale);
+        out[r] = dot;
+    }
+}
+
+/* Down projection: Q2_K dot products for rows [row0, row1).
+ * blocks: packed Q2_K blocks, row_bytes apart per output row.
+ * mid_i16: int16 SwiGLU mid activation [DS4_N_FF_EXP].
+ * mid_sums: pre-computed int32 sums per 32 elements.
+ * mid_scale: 1/quant_scale.  ew: expert weight multiplier. */
+void ds4_xeon_moe_down_rows(
+    float *out, const uint8_t *blocks, uint64_t row_bytes,
+    const int16_t *mid_i16, const int32_t *mid_sums, float mid_scale,
+    float ew, int row0, int row1)
+{
+    for (int r = row0; r < row1; r++) {
+        const ds4_xeon_block_q2_K *blk =
+            (const ds4_xeon_block_q2_K*)(blocks + (uint64_t)r * row_bytes);
+        float dot = 0.0f;
+        ds4_xeon_vec_dot_q2_K_vnni(DS4_N_FF_EXP, &dot, blk, mid_i16, mid_sums, mid_scale);
+        out[r] += ew * dot;
+    }
 }
 
 #else
@@ -1813,10 +1909,6 @@ void ds4_xeon_threads_bind(int numa_node) {
 
 void ds4_xeon_threads_init(void) {
     int nn = ds4_xeon_numa_init();
-    // Note: we do NOT bind threads here. The xeon path uses
-    // ds4_parallel_for (pthread pool, max 32 threads) for FFN parallelism.
-    // Binding OpenMP threads would interfere with the pthread pool.
-    // NUMA-local tensor data is handled by tensor_data() via numa_maps flag.
     fprintf(stderr, "ds4: Xeon backend: %d NUMA nodes detected\n",
             nn > 0 ? nn : 1);
 }
