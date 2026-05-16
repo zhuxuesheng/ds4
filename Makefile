@@ -173,6 +173,9 @@ xeon-math-test:
 xeon-op-bench:
 	$(CC) $(CFLAGS) -mprefer-vector-width=512 -fopenmp -o tests/ds4_xeon_op_bench tests/ds4_xeon_op_bench.c ds4_xeon.c $(LDLIBS)
 	./tests/ds4_xeon_op_bench
+xeon-predequant-bench:
+	$(CC) $(CFLAGS) -mprefer-vector-width=512 -fopenmp -o tests/ds4_xeon_predequant_bench tests/ds4_xeon_predequant_bench.c ds4_xeon.c $(LDLIBS)
+	./tests/ds4_xeon_predequant_bench
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
