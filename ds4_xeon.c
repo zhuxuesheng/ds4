@@ -1669,52 +1669,10 @@ void ds4_xeon_threads_bind(int numa_node) {
 
 void ds4_xeon_threads_init(void) {
     int nn = ds4_xeon_numa_init();
-
-    // Limit to physical cores (not hyperthreads) for memory-bandwidth-bound workloads
-    long n_online = sysconf(_SC_NPROCESSORS_ONLN);
-    int n_threads = (int)(n_online > 0 ? n_online : 48);
-    // Use at most 48 threads; hyperthreading hurts MoE memory bandwidth
-    if (n_threads > 48) n_threads = 48;
-    omp_set_num_threads(n_threads);
-
-    fprintf(stderr, "ds4: Xeon backend: %d OpenMP threads, %d NUMA nodes\n",
-            n_threads, nn > 0 ? nn : 1);
-
-    if (nn <= 0) return;
-
-    // Build per-node CPU sets from sysfs (physical cores only: skip odd CPUs on HT)
-    cpu_set_t *node_cpus[16] = {0};
-    int node_ncpu[16] = {0};
-    for (int n = 0; n < nn && n < 16; n++) {
-        node_ncpu[n] = numa_node_to_cpuset(n, &node_cpus[n]);
-    }
-
-    // Stripe OpenMP threads across NUMA nodes
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        int node = tid % nn;
-
-        if (node_cpus[node] && node_ncpu[node] > 0) {
-            int node_thread_idx = tid / nn;
-            int cpu_idx = 0, assigned = -1;
-            for (int c = 0; c < CPU_SETSIZE; c++) {
-                if (CPU_ISSET_S(c, CPU_ALLOC_SIZE(CPU_SETSIZE), node_cpus[node])) {
-                    if (cpu_idx == node_thread_idx % node_ncpu[node]) {
-                        assigned = c; break;
-                    }
-                    cpu_idx++;
-                }
-            }
-            if (assigned >= 0) {
-                cpu_set_t *ts = CPU_ALLOC(CPU_SETSIZE);
-                CPU_ZERO_S(CPU_ALLOC_SIZE(CPU_SETSIZE), ts);
-                CPU_SET_S(assigned, CPU_ALLOC_SIZE(CPU_SETSIZE), ts);
-                pthread_setaffinity_np(pthread_self(), CPU_ALLOC_SIZE(CPU_SETSIZE), ts);
-                CPU_FREE(ts);
-            }
-        }
-    }
-
-    for (int n = 0; n < nn; n++) CPU_FREE(node_cpus[n]);
+    // Note: we do NOT bind threads here. The xeon path uses
+    // ds4_parallel_for (pthread pool, max 32 threads) for FFN parallelism.
+    // Binding OpenMP threads would interfere with the pthread pool.
+    // NUMA-local tensor data is handled by tensor_data() via numa_maps flag.
+    fprintf(stderr, "ds4: Xeon backend: %d NUMA nodes detected\n",
+            nn > 0 ? nn : 1);
 }
