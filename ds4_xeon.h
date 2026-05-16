@@ -163,7 +163,12 @@ void ds4_xeon_vec_dot_q4_K_vnni(int n, float *s, const ds4_xeon_block_q4_K *x,
 void ds4_xeon_vec_dot_q4_K_vnni_8row(int n, float *s, const ds4_xeon_block_q4_K *w,
     const int16_t *a16, const int32_t *a16_sums, float s_a);
 
-// Q2_K dot product (existing)
+// Q2_K dot with Q8_K activation (same quantization as CPU, VNNI-accelerated)
+void ds4_xeon_vec_dot_q2_K_q8k_vnni(int n, float *s,
+    const ds4_xeon_block_q2_K *x,
+    const int8_t *q8, const float *q8_scale);
+
+// Q2_K dot product (existing, INT16 activation)
 void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
     const int16_t *y_i16, const int32_t *y_sum_32, float scale_y);
 

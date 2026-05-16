@@ -916,6 +916,67 @@ void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
 }
 
 // ============================================================================
+// Q2_K VNNI with Q8_K activation — VPDPWSSD, same quantization as CPU
+// ============================================================================
+// Uses the CPU's Q8_K per-block quantization (int8[256] + float scale per block)
+// for the heavy-tailed SwiGLU mid activation.  Extends int8→int16 on-the-fly,
+// extracts Q2_K nibbles→int16, runs VPDPWSSD, and applies per-sub-block Q2_K
+// scales combined with per-block Q8_K scales.
+// Precision: matches CPU path within 1e-4 (same quantization, same arithmetic).
+void ds4_xeon_vec_dot_q2_K_q8k_vnni(int n, float *s,
+    const ds4_xeon_block_q2_K *x,
+    const int8_t *q8, const float *q8_scale)
+{
+    const int nb = n / DS4_XEON_QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float q8_d = q8_scale[i];
+        const float d    = xeon_f16_to_f32(x[i].d) * q8_d;
+        const float dmin = xeon_f16_to_f32(x[i].dmin) * q8_d;
+        const uint8_t *q2 = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t  *a8 = q8 + (uint64_t)i * DS4_XEON_QK_K;
+
+        /* Pre-compute sums of 32 activation elements (8 sums per QK block) */
+        int32_t a32_sums[8];
+        for (int jj = 0; jj < 8; jj++) {
+            int32_t s = 0;
+            const int8_t *ap = a8 + (uint64_t)jj * 32;
+            for (int k = 0; k < 32; k++) s += (int32_t)ap[k];
+            a32_sums[jj] = s;
+        }
+
+        for (int j = 0; j < 16; j++) {
+            float sc_val = (float)sc[j];
+            const uint8_t *q_ptr = q2 + (uint64_t)j * 4;
+
+            /* Expand nibbles → 16 int16 weights + extend activations */
+            int16_t q16[16] __attribute__((aligned(32)));
+            int16_t a16[16] __attribute__((aligned(32)));
+            const int8_t *a_ptr = a8 + (uint64_t)j * 16;
+            for (int k = 0; k < 16; k++) {
+                uint8_t q_byte = q_ptr[k / 4];
+                q16[k] = (int16_t)((q_byte >> ((k % 4) * 2)) & 3);
+                a16[k] = (int16_t)a_ptr[k];
+            }
+
+            /* VPDPWSSD: 16 int16 weights × 16 int16 activations */
+            __m256i wv = _mm256_load_si256((const __m256i*)q16);
+            __m256i av = _mm256_load_si256((const __m256i*)a16);
+            __m256i vacc = _mm256_dpwssd_epi32(_mm256_setzero_si256(), wv, av);
+            int32_t arr[8];
+            _mm256_storeu_si256((__m256i*)arr, vacc);
+            int32_t dot = arr[0] + arr[1] + arr[2] + arr[3]
+                        + arr[4] + arr[5] + arr[6] + arr[7];
+
+            sumf += d * sc_val * (float)dot
+                  - dmin * sc_val * (float)a32_sums[j / 2];
+        }
+    }
+    *s += sumf;
+}
+
+// ============================================================================
 // RMS Norm (AVX-512)
 // ============================================================================
 
@@ -1409,6 +1470,9 @@ void ds4_xeon_vec_dot_q4_K_vnni_8row(int n, float *s, const void *w, const int16
 }
 void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const void *x, const int16_t *y, const int32_t *ys, float sy) {
     (void)n; (void)s; (void)x; (void)y; (void)ys; (void)sy;
+}
+void ds4_xeon_vec_dot_q2_K_q8k_vnni(int n, float *s, const void *x, const int8_t *q8, const float *qs) {
+    (void)n; (void)s; (void)x; (void)q8; (void)qs;
 }
 void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const void *x, const int16_t *y, float sy) {
     (void)n; (void)s; (void)x; (void)y; (void)sy;

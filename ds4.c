@@ -16764,7 +16764,7 @@ static void ds4_xeon_decode_token(
         hc_post_one(scratch->after_attn_hc, scratch->attn_out,
             scratch->attn_residual, post, comb, DS4_N_EMBD, DS4_N_HC);
 
-        /* === FFN: CPU path === */
+        /* === FFN: CPU path (baseline) === */
         layer_ffn_one_decode_scratch(next, &e->model, lw,
             scratch->after_attn_hc, il, token,
             e->directional_steering_dirs,
