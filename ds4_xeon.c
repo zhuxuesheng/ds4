@@ -840,7 +840,7 @@ void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs
             _mm_storeu_si128((__m128i*)si16, hi8);
             uint64_t mask[8];
             for (int qi = 0; qi < 8; qi++) {
-                mask[qi] = iq2xxs_sign_mask_lut[si16[qi * 2]];
+                mask[qi] = iq2xxs_sign_mask_lut[ksigns_iq2xs[si16[qi * 2]]];
             }
 
             // Load raw int8 weights and negation mask
@@ -1630,7 +1630,7 @@ void ds4_xeon_dequant_iq2xxs_block_to_u8(
         _mm_storeu_si128((__m128i*)si16, hi8);
         uint64_t mask[8];
         for (int qi = 0; qi < 8; qi++) {
-            mask[qi] = iq2xxs_sign_mask_lut[si16[qi * 2]];
+            mask[qi] = iq2xxs_sign_mask_lut[ksigns_iq2xs[si16[qi * 2]]];
         }
 
         // Load raw bytes and mask, apply conditional negation
