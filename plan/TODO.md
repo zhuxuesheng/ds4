@@ -1,435 +1,427 @@
-# TODO — DeepSeek V4 Flash Xeon Backend Implementation
+# Xeon Backend — Detailed Implementation TODO
 
-> 对照文档: `plan/intel_xeon_optimization_plan.md`
-> 每个 task 格式: **[ID] 标题 — 描述、验证标准、文档参照**
-
----
-
-## Phase 1: Backend Isolation & VNNI Micro-Benchmarks
-
-参照: `intel_xeon_optimization_plan.md` Section 4, Step 1
-
-### 1.1 创建后端隔离层
-
-- [x] **T1.1.1** 添加 `DS4_BACKEND_XEON` 到 `ds4_backend` 枚举
-  - 文件: `ds4.h`
-  - 验证: `grep DS4_BACKEND_XEON ds4.h` 返回新增枚举值
-  - 参照: plan Section 4, Step 1.1
-
-- [x] **T1.1.2** 创建 `ds4_xeon.h` 头文件（若不存在则新建，若存在则审查）
-  - 内容: 类型定义 (`ds4_xeon_block_q4_K`, `ds4_xeon_graph`, `ds4_xeon_model_context`), 函数声明
-  - 验证: 与 `ds4_xeon.c` 编译无缺失声明
-  - 参照: plan Section 5 (Plugin Graph Model), 现有 `ds4_xeon.h`
-
-- [x] **T1.1.3** 审查 `ds4_xeon.c` 现有实现
-  - 内容: 确认现有 kernel 位置 (`ds4_xeon_vec_dot_q4_K_vnni_8row`, `ds4_xeon_rms_norm`, `ds4_xeon_swiglu`, `ds4_xeon_quantize_a16`), 标记需重写/新增的函数
-  - 验证: 输出函数清单，标注每个函数的状态 (keep / rewrite / new)
-  - 参照: plan Section 3 Phase 2-3
-
-### 1.2 VPDPBUSD (INT8 VNNI) 微基准
-
-- [x] **T1.2.1** 编写 `matmul_w4a8_vnni` 纯 INT8 VNNI kernel
-  - 文件: `ds4_xeon.c`
-  - 内容: `_mm512_dpbusd_epi32` intrinsics, INT8 activation × uint8 weight → INT32 accumulator
-  - 验证: 编译通过, `objdump -d` 确认包含 `vpdpbusd` 指令
-  - 参照: plan Section 2.2 (VPDPBUSD 12.9 TOPS theoretical)
-
-- [x] **T1.2.2** 更新 `tests/ds4_xeon_matmul_bench.c` 增加 INT8 VNNI 测试
-  - 内容: N=K=4096, INT8 activations, uint8 weights, 测 VPDPBUSD 吞吐
-  - 验证: 输出 `>9 TOPS` (70% of 12.9 TOPS), 编译需 `-march=native -mprefer-vector-width=512`
-  - 参照: plan Section 4 Step 1.3
-
-- [x] **T1.2.3** 更新 Makefile `xeon-bench` target
-  - 内容: 加入 `-mprefer-vector-width=512` 编译选项
-  - 验证: `make xeon-bench` 成功编译并运行, 输出 INT8 + INT16 两项吞吐数据
-  - 参照: plan Section 4 Step 1.3
-
-### 1.3 VPDPWSSD (INT16 VNNI) 微基准
-
-- [x] **T1.3.1** 审查并优化已有 `matmul_w4a16_vnni` kernel
-  - 文件: `ds4_xeon.c` (现有 `bench_vnni_multi_thread` 逻辑迁移为正式 kernel)
-  - 优化点: reduction 移出 inner loop, 检查 8-way unroll 是否足够隐藏延迟
-  - 验证: 吞吐 ≥4.5 TOPS (70% of 6.4 TOPS)
-  - 参照: plan Section 2.2 (VPDPWSSD 6.4 TOPS theoretical), 现有 `tests/ds4_xeon_matmul_bench.c`
+> 目标: decode 5-10 tok/s (IQ2XXS 模型), interactive prefill 30-80 tok/s, large-batch prefill 70-140 tok/s
+> 方法: 先 benchmark 每个算子 → 推算每层时间 → 对比预算 → 组装完整流程
+> 关键约束: 单 token decode 受 DRAM 带宽限制 (~7.6 GB 权重读取), 上限由带宽决定非算力
 
 ---
 
-## Phase 2: Activation Quantization Kernels
+## 时间预算 (per token, per layer)
 
-参照: `intel_xeon_optimization_plan.md` Section 4, Step 2
+decode 目标 5-10 tok/s → 100-200ms/token → **2.33-4.65ms/layer**
 
-### 2.1 Per-block INT8 量化
+| 子层 | 操作 | 预算 (μs) | 占比 |
+|------|------|-----------|------|
+| Attention | Q/KV/Output 投影 + QK^T + softmax + weighted sum | ~400 | ~15% |
+| MoE FFN | 6 experts × (gate + up + SwiGLU + down) | ~1600 | ~60% |
+| Shared FFN | gate + up + SwiGLU + down | ~300 | ~10% |
+| HC + Norm + 其他 | HC pre/post, RMS norm, router, residual | ~200 | ~8% |
+| Barrier × 3 | 线程同步 | ~50 | ~2% |
+| **合计** | | **~2550** | |
 
-- [x] **T2.1.1** 实现 `quantize_a8_per_block`
-  - 文件: `ds4_xeon.c`
-  - 内容: 移植 `ds4.c:3130 quantize_q8_0_activation` 到 AVX-512, 用 `_mm512_reduce_max_ps` 替换标量 max 查找, per-32-element block 动态 scale
-  - 验证: 对标量参考实现, 输出值 bit-exact 匹配 (0 mismatches)
-  - 参照: plan Section 2.4 (per-block INT8 安全分析), `ds4.c:3130-3153`
+> 如果单层超过 4.6ms, decode 无法达到 5 tok/s。每个算子的 benchmark 必须在这个预算内验证。
 
-- [x] **T2.1.2** 基准测试 `quantize_a8_per_block` 吞吐
-  - 文件: `tests/ds4_xeon_math_test.c`
-  - 内容: 4096-dim vector × 1024 tokens, 测量 GB/s (内存带宽利用率)
-  - 验证: 190 GB/s > 100 GB/s 目标
-  - 参照: plan Section 2.1 (260 GB/s sustained sequential)
-
-### 2.2 Per-token INT16 量化
-
-- [x] **T2.2.1** 优化 `ds4_xeon_quantize_a16`
-  - 文件: `ds4_xeon.c` (现有函数)
-  - 内容: 用 `_mm512_reduce_max_ps` 替换标量 max 查找, 添加 `#pragma omp parallel for` 已有检查是否正确
-  - 验证: 197 GB/s, ~20x vs scalar baseline
-  - 参照: plan Section 3 Phase 2 (INT16 fallback kernel)
-
-### 2.3 精度验证
-
-- [x] **T2.3.1** Roundtrip fidelity 测试
-  - 文件: `tests/ds4_xeon_math_test.c`
-  - 内容: FP32 → INT8 per-block → dequant → FP32, 计算 cosine similarity
-  - 验证: cos-sim >0.9999 (Gaussian), >0.9999 (Uniform), >0.9999 (Heavy-tailed)
-  - 参照: plan Section 2.4 (caveat: cos-sim >0.999 不保证 token 不漂)
-
-- [x] **T2.3.2** SwiGLU mid INT8 vs INT16 对比
-  - 文件: `tests/ds4_xeon_math_test.c`
-  - 内容: 从真实模型 forward pass 提取 SwiGLU mid activation, 分别用 INT8 per-block 和 INT16 per-token 量化, 对比 SNR
-  - 验证: INT16 SNR 81.4 dB vs INT8 SNR 38.4 dB, 差距 43 dB > 10 dB 阈值
-  - 参照: plan Section 2.4 (SwiGLU mid heavy-tailed)
-
-- [ ] **T2.3.3** 混合精度端到端 token 匹配测试 【阻塞: 依赖 Phase 3, 4, 5】
-  - 文件: `tests/ds4_xeon_math_test.c`
-  - 内容: 加载真实模型, 对 3 个 prompt (短推理/代码/长文本), 对比 `-xeon` 混合精度路径 vs `-cpu` 标量参考, 逐 token 对比
-  - 验证: token 序列完全一致 (100+ tokens), logits 相对误差 <1e-3
-  - 参照: plan Section 2.4 caveat, Section 4 Step 5.2
+prefill interactive (batch=32) 目标 30 tok/s → 32/30 = 1.07s per prefill → 1.07/43 = **~25ms/layer**
 
 ---
 
-## Phase 3: Weight Dequantization & Pre-dequant Infrastructure
+## Phase A: 算子级 Benchmark — 用真实维度测量每个算子的吞吐
 
-参照: `intel_xeon_optimization_plan.md` Section 4, Step 3
+所有 benchmark 放在 `tests/ds4_xeon_op_bench.c`。用真实的模型维度参数：
+- n_embd = 4096, n_ff_exp = 2048, n_head = 64, n_head_dim = 512
+- n_expert = 256, n_expert_used = 6, n_lora_q = 1024, n_layer = 43
 
-### 3.1 Q4_K 解包
+### A.1 IQ2XXS 即时反量化点积 (gate/up 投影)
 
-- [x] **T3.1.1** 实现 `unpack_q4_k_to_u8` — 4-bit nibbles → uint8_t
-  - 文件: `ds4_xeon.c`
-  - 内容: 标量 nibble 提取 + scale factor 计算, AVX-512 版本可选优化
-  - 验证: bit-exact 匹配 (0 mismatches), 测试通过
-  - 参照: plan Section 2.5 Bottleneck 2
+**CPU 参考**: `ds4_vec_dot_iq2_xxs_q8_K` (ds4.c) — 标量 grid 查表 + 点积
+**Xeon 已有**: `ds4_xeon_vec_dot_iq2_xxs_vnni` (ds4_xeon.c:808) — AVX-512 gather + LUT + VPDPWSSD, 2.6x vs scalar
 
-- [x] **T3.1.2** 实现 `unpack_q4_k_to_i16` — 4-bit nibbles → int16_t (供 VPDPWSSD)
-  - 文件: `ds4_xeon.c`
-  - 内容: 标量 nibble 提取为 int16 (raw values 0-15, 不包含 dequant 公式)
-  - 验证: bit-exact 匹配 (0 mismatches), 测试通过
-  - 参照: plan Section 3 Phase 2 (down projection INT16)
+Benchmark:
+- 输入: INT16 activation [256], IQ2XXS block (66 bytes), scale_y
+- 调用次数: gate 投影需要 2048 次 (每个输出行一次), 6 experts × 2 (gate+up) = 24576 次/layer
+- 验证: 计算 1 次 dot 的延迟 (ns), 以及 24576 次的总时间 (μs)
+- **预算**: gate+up 共 24576 dots/layer, 每个 dot 目标 < 16ns → 总时间 < 400μs
 
-- [x] **T3.1.3** 基准测试: kernel 中 dequant 占比
-  - 内容: Full dequant (nibble→float→scale*q-min→clamp→int16) vs Raw unpack (nibble→int16) 吞吐对比
-  - 验证: Dequant overhead 57-60%, 远超文档假设的 30-50%, 确认 pre-dequant 极其重要
-  - 参照: plan Section 2.5 Bottleneck 2
+### A.2 Q2_K 即时反量化点积 (down 投影)
 
-### 3.2 IQ2XXS 解包 (矢量化)
+**CPU 参考**: `ds4_vec_dot_q2_K_q8_K` (ds4.c) — 标量 nibble 提取 + 点积
+**Xeon 已有**: `ds4_xeon_vec_dot_q2_K_vnni` (ds4_xeon.c:884) — **标量内循环, 无 AVX-512**
 
-- [x] **T3.2.1** 矢量化 `ds4_xeon_vec_dot_iq2_xxs_vnni` 标量内循环
-  - 文件: `ds4_xeon.c`
-  - 内容: AVX-512 gather (`_mm512_i32gather_epi64`) grid lookup + LUT 符号掩码展开 + `_mm512_sub_epi8(_mm512_xor_si512(w,m),m)` 条件取反 + VPDPWSSD 点积
-  - 验证: 吞吐提升 2.6× (scalar 0.98 GOPS → vectorized 2.5 GOPS), 正确性 bit-exact
-  - 参照: plan Section 4 Step 3.3
+Benchmark:
+- 输入: INT16 activation [256], Q2_K block (84 bytes), scale_y, y_sum
+- 调用次数: down 投影 4096 行, 6 experts × 4096 = 24576 次/layer
+- 验证: 计算 1 次 dot 的延迟, 以及 24576 次的总时间
+- **预算**: down 共 24576 dots/layer, 每个 dot 目标 < 12ns → 总时间 < 300μs
+- **注意**: 当前标量实现远慢于此, 必须向量化
 
-- [x] **T3.2.2** IQ2XXS 解包正确性验证
-  - 内容: 对标量参考输出, 256 blocks 逐元素比较
-  - 验证: rel_err=0.00e+00 bit-exact 匹配, 测试通过
-  - 参照: plan Section 4 Step 3.5
+### A.3 Q8_0 VNNI matvec (共享 FFN + Attention 投影)
 
-### 3.3 Pre-dequant 加载器
+**CPU 参考**: `matvec_q8_0` / `matvec_q8_0_decode_scratch` (ds4.c) — Q8_0 反量化 + FP32 FMA
+**Xeon 缺失**: 需要实现 `ds4_xeon_matvec_q8_0_vnni` — Q8_0 权重已是 INT8, 用 VPDPBUSD
 
-- [x] **T3.3.1** 实现 `xeon_predequant_load` — 模型加载时预解包
-  - 文件: `ds4_xeon.c` (block dequant) + `ds4.c` (per-layer driver)
-  - 内容: `ds4_xeon_dequant_iq2xxs_block_to_u8` AVX-512 向量化 (4.63 GB/s, 3.3x vs scalar), `ds4_xeon_dequant_q2k_block_to_i16` 标量, `ds4_xeon_predequant_layer` 遍历 256 experts × 3 projections 逐层反量化
-  - 内存: 单缓冲 8.6 GB (1× n_expert × 2 × n_embd × n_ff_exp uint8 + n_expert × n_ff_exp × n_embd int16)
-  - 验证: 0 mismatches vs 标量参考, 每层 ~1.4s, 全部 43 层 ~60s 一次性启动成本
-  - 参照: plan Section 6 Decision 2
+Q8_0 格式: 每 32 元素一个 block (int8_t[32] + float scale)
+- 反量化: w_f32[i] = w_i8[i] * scale
+- VNNI 路径: 直接 VPDPBUSD(activation_i8, weight_u8) → INT32 acc → scale 修正 → float
 
-- [x] **T3.3.2** 实现 NUMA 感知分配 (替代 hugepage)
-  - 文件: `ds4_xeon.c`
-  - 内容: `ds4_xeon_numa_alloc()` — mmap + mbind syscall, 无 libnuma 依赖, 失败回退 aligned_alloc
-  - 验证: 编译通过, 2 NUMA nodes 检测正常
-  - 注: 真正的 1GB hugepage 需要内核 hugetlbfs 配置, 暂用 NUMA binding 替代
+Benchmark (3 种维度):
+- (a) 4096 → 2048 (shared FFN gate/up): 2048 行, 每行 4096 维
+- (b) 2048 → 4096 (shared FFN down): 4096 行, 每行 2048 维
+- (c) 4096 → 1024 (Q projection LoRA down): 1024 行
+- (d) 1024 → 32768 (Q projection LoRA up): 32768 行
+- (e) 4096 → 512 (KV projection): 512 行
+- (f) 32768 → 4096 (output projection): 4096 行 (grouped: 8 groups × 4096→1024 + 8192→4096)
+- 验证: 每个 matvec 延迟 vs CPU 标量, 加速比目标 >3x
+- **预算**: shared FFN ~200μs, attention 投影 ~200μs, 合计 ~400μs
 
-- [x] **T3.3.3** Pre-dequant 基准测试
-  - 内容: IQ2XXS dequant to uint8 吞吐对比 (标量 vs AVX-512)
-  - 验证: AVX-512 4.63 GB/s vs 标量 1.39 GB/s, 3.3x 加速比
-  - 注: on-the-fly vs pre-dequant 端到端对比依赖 T7.2 batch GEMM
+### A.4 RMS Norm
 
----
+**CPU 参考**: `rms_norm_weight` (ds4.c:3294) — FP32 FMA
+**Xeon 已有**: `ds4_xeon_rms_norm` (ds4_xeon.c:916) — AVX-512
 
-## Phase 4: Static Graph, NUMA Topology & Expert Replication
+Benchmark:
+- 输入: float[4096], float weight[4096]
+- 调用次数: 5-6 次/layer (attn_norm, ffn_norm ×2, q_a_norm, q_out_norm, kv_norm)
+- 验证: 延迟 < 2μs/次
+- **预算**: ~10μs/layer
 
-参照: `intel_xeon_optimization_plan.md` Section 4, Step 4
+### A.5 INT8 per-block 量化 (RMS Norm 输出 → INT8)
 
-### 4.1 静态图定义
+**CPU 参考**: `quantize_q8_0_activation` (ds4.c:3844) — 标量 max + 量化
+**Xeon 已有**: `ds4_xeon_quantize_a8_per_block` (ds4_xeon.c:419) — AVX-512 reduce_max + round+pack
 
-- [x] **T4.1.1** 重构 `ds4_xeon_graph` 结构体
-  - 文件: `ds4_xeon.h`
-  - 内容: 按精度类型预分配 buffer (a8_cur + scale, a16_mid + scale, a16_residual, f32_attn_out, f32_ffn_cur, f32_norm, f32_gate, f32_up, f32_mid, f32_hc, f32_router_logits, selected_experts, expert_weights, f32_shared_out, f32_moe_out)
-  - 验证: 编译通过, 所有 buffer 字段与 plan 一致
-  - 参照: plan Section 3 Phase 1
+Benchmark:
+- 输入: float[4096], block_size=64, 输出 int8[4096] + float scale[64]
+- 调用次数: 2-3 次/layer (FFN norm 输出, attention norm 输出)
+- 验证: 延迟 < 5μs/次
+- **预算**: ~15μs/layer
 
-- [x] **T4.1.2** 实现 `ds4_xeon_graph_init` 和 `ds4_xeon_graph_free`
-  - 文件: `ds4_xeon.c`
-  - 内容: `aligned_alloc(64, ...)` 分配所有 buffer, 全部初始化为零, free 时检查非 NULL, 新增 n_hc / numa_node 参数
-  - 验证: 编译通过, 分配/释放逻辑完整
-  - 参照: plan Section 3 Phase 1
+### A.6 INT16 per-token 量化 (SwiGLU mid → INT16)
 
-### 4.2 NUMA Expert 权重复制
+**CPU 参考**: `ds4_quantize_row_q8_K` (ds4.c) — Q8_K 量化 (256-block)
+**Xeon 已有**: `ds4_xeon_quantize_a16_per_token` (ds4_xeon.c:472) — AVX-512 reduce_max
 
-- [x] **T4.2.1** 检测 NUMA 拓扑
-  - 文件: `ds4_xeon.c`
-  - 内容: `ds4_xeon_numa_init()` — sysfs 读取 `/sys/devices/system/node/online` 检测 NUMA nodes, 无 libnuma 依赖
-  - 验证: 在双路服务器上输出 `NUMA available, 2 nodes detected`
-  - 参照: plan Section 2.1
+Benchmark:
+- 输入: float[2048], 输出 int16[2048] + float scale (per-token)
+- 调用次数: 6 experts × 1 = 6 次/layer
+- 验证: 延迟 < 3μs/次
+- **预算**: ~18μs/layer
 
-- [x] **T4.2.2** 实现 expert 权重跨 socket 复制
-  - 文件: `ds4.c` (model struct + tensor_data), `ds4_xeon.c/.h` (numa helpers)
-  - 内容: dual-mmap (map + map_alt) + mbind(MPOL_BIND, node1) 零拷贝权重复制; tensor_data 通过 sched_getcpu() 自动选本地 mapping; prefill_xeon_graph 启用 numa_maps
-  - 验证: 编译通过, dual-mmap 创建成功
-  - 参照: plan Section 6 Decision 1
+### A.7 SwiGLU
 
-- [x] **T4.2.3** 静态图 buffer NUMA 分配 (已完成)
-  - 文件: `ds4_xeon.c`
-  - 内容: `ds4_xeon_numa_alloc()` — mmap + mbind syscall
-  - 验证: 编译通过
+**CPU 参考**: `swiglu` (ds4.c:5827) — FP32
+**Xeon 已有**: `ds4_xeon_swiglu` (ds4_xeon.c:1126) — AVX-512
 
-### 4.3 线程绑定
+Benchmark:
+- 输入: float gate[2048], float up[2048], 输出 float[2048]
+- 调用次数: 7 次/layer (6 experts + 1 shared)
+- 验证: 延迟 < 2μs/次
+- **预算**: ~14μs/layer
 
-- [x] **T4.3.1** 实现 `ds4_xeon_threads_init` + `ds4_xeon_threads_bind`
-  - 文件: `ds4_xeon.c`
-  - 内容: sysfs cpulist 解析 + `pthread_setaffinity_np` — 将 OpenMP threads 按 striped 方式绑定到指定 NUMA node 的 CPU set
-  - 验证: 编译通过, sysfs 解析健壮 (支持 "0,2,4,6" / "0-5" / "0-23,48-71" 格式)
-  - 参照: plan Section 3 Phase 1, plan Section 4 Step 4.3
+### A.8 Per-Expert 完整 MoE (组合 A.1+A.2+A.6+A.7)
 
-### 4.4 Lock-free Expert Dispatch
+**Xeon 已有**: `ds4_xeon_routed_moe_one_expert` (ds4_xeon.c:971) — 组合 gate→up→SwiGLU→quantize→down
+- 使用 `static` buffer (线程不安全, 需要修)
+- gate/up 用 `ds4_xeon_vec_dot_iq2_xxs_vnni`
+- down 用 `ds4_xeon_vec_dot_q2_K_vnni` (标量!)
 
-- [ ] **T4.4.1** 实现 worker-group 模型 【阻塞: 依赖 Phase 5 前向传播实现】
-  - 文件: `ds4_xeon.c`
-  - 内容: 每个 socket 内的线程池进一步划分为 expert worker group, token 通过原子队列 dispatch
-  - 验证: barrier 数量从 ~6/layer 降到 ~3/layer
+Benchmark:
+- 输入: float x[4096] (RMS-normed), expert 的 IQ2XXS gate/up blocks, Q2_K down blocks, expert_weight
+- 输出: float out[4096] (累加到 accumulator)
+- 调用次数: 6 次/layer
+- 验证: 单 expert 延迟, 以及 6 experts 总时间
+- **预算**: 6 experts < 1600μs, 单 expert < 267μs
 
-- [ ] **T4.4.2** Barrier 开销基准 【阻塞: 依赖 T4.4.1】
-  - 内容: 测量单层 3-barrier 路径 vs 6-barrier 路径的 wall-clock 时间
-  - 验证: 3-barrier 路径快 >10%
-  - 参照: plan Section 2.5 Bottleneck 4, plan Section 3 Phase 4
+### A.9 Attention Scores (QK^T + softmax + weighted sum)
 
----
+**Xeon 已有**: `ds4_xeon_attn_scores` (ds4_xeon.c:1047) — AVX-512 FMA + 标量 softmax
+- 注意: 当前实现有 heap allocation (FIXME comment), 需要修
 
-## Phase 5: Engine Integration & End-to-End Validation
+Benchmark:
+- 输入: float q[64][512], float kv[n_raw][512], uint32_t n_visible
+- decode 时 n_raw = pos+1 (随上下文增长)
+- 验证: pos=100/1000/10000/32768 时的延迟
+- **预算**: short context ~50μs, long context ~500μs
 
-参照: `intel_xeon_optimization_plan.md` Section 4, Step 5
+### A.10 HC pre/post (Host Context)
 
-### 5.1 Prefill/Decode 入口
+**CPU 参考**: `hc_pre_from_state_one_scratch` + `hc_post_one` (ds4.c) — FP32 FMA, 小维度
+**策略**: 保持 CPU 路径, HC 操作太小 (<10μs), VNNI 无收益
 
-- [x] **T5.1.1** 实现 prefill (在 ds4.c 中)
-  - 文件: `ds4.c` (prefill_xeon_graph, line 15610)
-  - 内容: 完整 prefill 循环 (embedding → 43 layers × [attention + MoE FFN + HC] → LM head), 调用 CPU attention + xeon FFN batch
-  - 验证: `make cpu` 编译通过 (ds4, ds4-server, ds4-bench)
-  - 参照: plan Section 3 Phase 3
+Benchmark:
+- 验证: HC pre + post 总延迟 < 20μs
 
-- [x] **T5.1.2** 实现 decode (复用 ds4_session_sync)
-  - 内容: 单 token decode 通过 ds4_session_sync 复用 CPU 路径, KV cache 读写与 CPU 后端一致
-  - 验证: 编译通过, generate_xeon_graph_raw_swa 完整实现
-  - 参照: plan Section 5.2
+### A.11 Router (F16 matvec + softmax + top-k)
 
-- [x] **T5.1.3** 在 `ds4.c` 中添加 dispatch hook (~30-50 行)
-  - 文件: `ds4.c` (line 15601 generate_xeon_graph_raw_swa, line 16880 DS4_BACKEND_XEON branch)
-  - 内容: `ds4_session_create` 中 `if (backend == DS4_BACKEND_XEON)` 初始化 graph; prefill/decode 循环中 dispatch 到 xeon 函数
-  - 验证: `-xeon` flag 可选中 Xeon 后端, `make cpu` 编译通过 (ds4 + ds4-server + ds4-bench)
-  - 参照: plan Section 5
+**CPU 参考**: `layer_router_probs_one` + `layer_topk_selected_experts_from_probs` (ds4.c)
+**策略**: 保持 CPU 路径, 4096×256 维度太小, FMA 足够
 
-### 5.2 端到端正确性 【阻塞: 需要模型权重文件】
+Benchmark:
+- 验证: router 总延迟 < 10μs
 
-- [ ] **T5.2.1** Token 序列完全匹配测试
-  - 内容: `-xeon` vs `-cpu` 逐 token 对比, >100 tokens 序列完全一致
-  - 验证: 需要真实 .ds4 模型文件
+### A.12 Embedding + LM Head
 
-- [ ] **T5.2.2** Logits 误差测试
-  - 验证: 需要真实模型文件
+**策略**: 保持 CPU 路径
+- Embedding: F16 查表 (129280 × 4096), 1 次/token
+- LM Head: Q8_0 matvec 4096→129280, 1 次/token, 可以后续优化
 
-- [ ] **T5.2.3** 长上下文 KV cache 正确性测试
-  - 验证: 需要真实模型文件
-
-### 5.3 端到端性能 【阻塞: 需要模型权重文件 + T5.2】
-
-- [ ] **T5.3.1** Prefill 吞吐基准 (目标: 70-140 tok/s)
-- [ ] **T5.3.2** Decode 吞吐基准 (目标: 5-10 tok/s Q4KExperts)
-- [ ] **T5.3.3** Interactive prefill 性能 (目标: 30-80 tok/s)
+Benchmark:
+- 验证: embedding < 10μs, LM head < 500μs
 
 ---
 
-## Phase 5.5: Attention VNNI Optimization
+## Phase B: 预反量化 — 实现 + 与即时反量化对比
 
-参照: `intel_xeon_optimization_plan.md` Section 3 Phase 2
+Phase A 测试即时反量化路径 (on-the-fly dequant from IQ2XXS/Q2_K blocks)。Phase B 实现预反量化路径, 然后对比两种方案在 decode 和 prefill 场景下的优劣。
 
-Attention weights are Q8_0 format (already int8), ready for VPDPBUSD without pre-dequant.
-Per-layer compute: ~4-5B MACs (Q+KV+Output projections + attention scores).
-With VPDPBUSD at ~10 TOPS effective, target <0.5ms per layer for batch=10.
+### B.1 IQ2XXS → uint8 预反量化
 
-### 5.5.1 Q/KV/Output 投影
+**已有**: `ds4_xeon_dequant_iq2xxs_block_to_u8` (ds4_xeon.c:1287) — AVX-512 gather+LUT, 4.63 GB/s
 
-- [ ] **T5.5.1** 实现 `ds4_xeon_attn_q_proj` — Q 投影 (LoRA: q_a down + q_b up)
-  - 文件: `ds4.c` (access attn_q_a / attn_q_b tensors)
-  - 内容: Q8_0 weight → ds4_xeon_matmul_a8w8_vnni_batch (VPDPBUSD)
-  - 验证: 输出与 CPU 路径 bit-exact 匹配
+Benchmark:
+- 输入: 1 个 expert 的 gate (2048 rows × 4096 cols → 2048×16=32768 blocks)
+- 测量: 单 expert 的 gate+up 预反量化时间 (MB processed, GB/s)
+- **全模型**: 256 experts × 43 layers × 3 projections ≈ 大量 blocks
+- 验证: 全部 256 experts × 43 layers 预反量化总时间, 目标 < 120s (一次性启动成本)
 
-- [ ] **T5.5.2** 实现 `ds4_xeon_attn_kv_proj` — KV 投影
-  - 文件: `ds4.c`
-  - 内容: Q8_0 weight → VPDPBUSD batch matmul
-  - 验证: 输出与 CPU 路径 bit-exact 匹配
+### B.2 Q2_K → int16 预反量化
 
-- [ ] **T5.5.3** 实现 `ds4_xeon_attn_output_proj` — Output 投影 (grouped LoRA)
-  - 文件: `ds4.c`
-  - 内容: Q8_0 weight → VPDPBUSD batch matmul
-  - 验证: 输出与 CPU 路径 bit-exact 匹配
+**已有**: `ds4_xeon_dequant_q2k_block_to_i16` (ds4_xeon.c:1337) — 标量 2-bit 提取 + AVX-512 float 运算
 
-### 5.5.2 Attention Scores
+Benchmark:
+- 输入: 1 个 expert 的 down (4096 rows × 2048 cols → 4096×8=32768 blocks)
+- 测量: 吞吐 (GB/s)
+- 验证: 对标量参考 bit-exact
 
-- [ ] **T5.5.4** 实现 `ds4_xeon_attn_scores` — QK^T + softmax + weighted sum
-  - 文件: `ds4_xeon.c`
-  - 内容: AVX-512 Flash-Attention: Q[heads][512] × K^T[512][seq] → softmax → × V[seq][512]
-  - 验证: 输出与 CPU 路径逐元素误差 <1e-4
+### B.3 INT8 VNNI matmul with 预反量化权重 (VPDPBUSD)
 
-### 5.5.3 集成
+**已有**: `ds4_xeon_matmul_a8w8_vnni` (ds4_xeon.c:72) — 微基准 13.72 TOPS
+- 但这个 kernel 用的是纯 uint8 weight, 实际使用时需要结合 Q8_0 scale
 
-- [ ] **T5.5.5** 替换 `prefill_xeon_graph` 中的 `layer_attention_raw_swa_batch` 调用
-  - 内容: 用 xeon attention kernel 替换 CPU attention batch
-  - 验证: prefill 总时间从 ~2s/layer 降到 <0.5s/layer
+需要实现: `ds4_xeon_matmul_a8w8_q80` — INT8 activation (per-32 block scale) × Q8_0 weight (per-32 block scale) → float
+- Q8_0 weight 的 scale 需要在 VNNI 累加后应用
 
----
+Benchmark:
+- (a) 4096×2048 matmul (gate/up): 延迟和有效 TOPS
+- (b) 2048×4096 matmul (down): 延迟和有效 TOPS
+- 验证: 输出 vs CPU 标量参考, 相对误差 < 1e-3
 
-## Phase 6: KV Cache & Long-Context Optimization
+### B.4 INT16 VNNI matmul with 预反量化权重 (VPDPWSSD)
 
-参照: `intel_xeon_optimization_plan.md` Section 4, Step 6
+**已有**: `ds4_xeon_matmul_a16w16_vnni` (ds4_xeon.c:260) — 微基准 5.10 TOPS
 
-- [ ] **T6.1** KV cache NUMA 本地分配
-  - 文件: `ds4_xeon.c`
-  - 内容: KV cache 按层和 head 维度跨 socket 分区, `numa_alloc_onnode`
-  - 验证: 128K context 时 KV cache access 全为 local NUMA
-  - 参照: plan Section 4 Step 6.1
+Benchmark:
+- 输入: INT16 activation (per-token scale) × INT16 weight (来自 B.2 预反量化)
+- 维度: 2048×4096 (down projection)
+- 验证: 延迟, 以及 vs 即时反量化 Q2_K 点积的对比
 
-- [ ] **T6.2** Attention KV prefetch
-  - 文件: `ds4_xeon.c`
-  - 内容: 在 FFN compute 期间用 `_mm_prefetch` 预取下一层的 KV cache block
-  - 验证: `perf stat -e LLC-load-misses` 在 attention 阶段下降 >30%
-  - 参照: plan Section 4 Step 6.2
+### B.5 即时反量化 vs 预反量化 — 端到端 per-expert 对比
 
-- [ ] **T6.3** FP8 KV cache
-  - 文件: `ds4_xeon.c`
-  - 内容: 复用 `ds4.c:1642 dsv4_fp8_kv_quantize_row_inplace_cpu`, 将 KV cache 压缩为 FP8
-  - 验证: KV cache 内存占用减半, 长上下文 decode 吞吐提升 >15%
-  - 参照: plan Section 4 Step 6.3
+用同一个 expert 对比两种路径的完整延迟:
 
-- [ ] **T6.4** 长上下文 decode 基准
-  - 内容: 128K context, 测量 decode tok/s
-  - 验证: 达到 3-7 tok/s 目标区间
-  - 参照: plan Section 2.6
+路径 1 (即时): `ds4_xeon_routed_moe_one_expert` (INT16 量化输入 → IQ2XXS dot ×2048×2 → SwiGLU → INT16 量化 → Q2_K dot ×4096)
+路径 2 (预反量化): INT8 量化输入 → VPDPBUSD matmul ×2048×2 → SwiGLU → INT16 量化 → VPDPWSSD matmul ×4096
+
+Benchmark:
+- 单 expert, batch=1 (decode 场景)
+- 单 expert, batch=32 (prefill 场景)
+- 验证: 延迟对比表, 选出 decode/prefill 分别的最优方案
+- **决策点**: 如果预反量化在 decode 中因为内存流量增大而慢于即时反量化, decode 走即时, prefill 走预反量化
 
 ---
 
-## Phase 7: Expert Batching (Token Regrouping)
+## Phase C: 逐层时间预算验证
 
-参照: `intel_xeon_optimization_plan.md` Section 3 Phase 5, Section 4 Step 7
+把 Phase A+B 的 benchmark 结果汇总, 计算单层 decode 和单层 prefill 的预计时间, 对比预算。
 
-- [x] **T7.1** 实现 router 后 token→expert 倒排索引
-  - 文件: `ds4.c` (ds4_xeon_ffn_shared_batch)
-  - 内容: router top-k 后构建 `expert[eid] → [(token_idx, gate_score), ...]` 映射, 动态扩容
-  - 验证: 编译通过, 倒排索引构建逻辑完整, expert 负载统计输出
-  - 参照: plan Section 3 Phase 5
+### C.1 Decode 逐层时间表
 
-- [x] **T7.2** 实现 batched expert GEMM
-  - 文件: `ds4.c` (ds4_xeon_ffn_shared_batch)
-  - 内容: 对每个 expert e 收集所有 routed tokens 的 activation, 量化 int8, batch matmul via ds4_xeon_matmul_a8w8_vnni_batch (VPDPBUSD), SwiGLU, 量化 int16, down matmul via ds4_xeon_matmul_a16w16_vnni_batch (VPDPWSSD)
-  - 验证: 编译通过, 端到端 prefill 运行中
+| 操作 | 调用次数 | 单次延迟 (实测) | 总时间 | 预算 | 状态 |
+|------|---------|---------------|--------|------|------|
+| RMS norm | 5 | ? μs | ? μs | 10 μs | |
+| INT8 quant | 2 | ? μs | ? μs | 15 μs | |
+| Router | 1 | ? μs | ? μs | 10 μs | |
+| Expert gate (即时) | 6×2048 dots | ? μs | ? μs | 400 μs | |
+| Expert up (即时) | 6×2048 dots | ? μs | ? μs | 400 μs | |
+| SwiGLU | 7 | ? μs | ? μs | 14 μs | |
+| INT16 quant mid | 6 | ? μs | ? μs | 18 μs | |
+| Expert down (即时) | 6×4096 dots | ? μs | ? μs | 300 μs | |
+| Shared FFN (Q8_0 VNNI) | 3 matvecs | ? μs | ? μs | 300 μs | |
+| Attn Q proj (Q8_0 VNNI) | 2 matvecs | ? μs | ? μs | 80 μs | |
+| Attn KV proj (Q8_0 VNNI) | 1 matvec | ? μs | ? μs | 40 μs | |
+| Attn scores | 1 | ? μs | ? μs | 50 μs | |
+| Attn out proj (Q8_0 VNNI) | 2 matvecs | ? μs | ? μs | 80 μs | |
+| HC pre/post | 2 | ? μs | ? μs | 20 μs | |
+| Barrier | 3 | ? μs | ? μs | 50 μs | |
+| **合计** | | | **? μs** | **2550 μs** | |
 
-- [x] **T7.3** 实现结果 scatter
-  - 文件: `ds4.c` (ds4_xeon_ffn_shared_batch, 3rd pass)
-  - 内容: 将 batched expert down output × expert_weight 累加到 per-token MoE buffer, 合并 shared FFN, HC post
+- 验证: 实测合计 < 2550μs → decode 可达 5 tok/s; < 1300μs → 可达 10 tok/s
+- 如果超预算: 标记瓶颈算子, 优先优化
 
-- [ ] **T7.4** L3 cache 命中率验证 【阻塞: 依赖 T7.2】
-- [ ] **T7.5** Expert batching 性能基准 【阻塞: 依赖 T7.2】
-- [x] **T7.6** Token routing entropy 统计
-  - 内容: 输出 expert 负载分布 (active/max/avg), 确认无严重不均衡
+### C.2 Prefill (batch=32) 逐层时间表
 
----
+类似的表, 但用 batched kernel:
+- Expert gate/up: `ds4_xeon_vec_dot_iq2_xxs_vnni` 对每个 batch token 调用, 或 batched version
+- 预反量化路径: `ds4_xeon_matmul_a8w8_vnni_batch` (batch tokens per expert)
+- Shared FFN: batched Q8_0 matmul
+- Attention: batched 投影 + batched attention scores
 
-## Phase 8: Speculative Decoding Infrastructure
-
-参照: `intel_xeon_optimization_plan.md` Section 3 Phase 6, Section 4 Step 8
-
-- [ ] **T8.1** Draft model 选择与集成
-  - 内容: 选择/训练一个 ~1B 参数的小模型作为 draft model (建议 LLaMA 架构, INT8), 加载到独立 weight buffer
-  - 验证: draft model 单独运行正确, 生成 tokens 与参考实现一致
-  - 参照: plan Section 3 Phase 6
-
-- [ ] **T8.2** 实现 speculative verify pass
-  - 文件: `ds4_xeon.c`
-  - 内容: 主模型接收 K 个 draft tokens, 一次 micro-batch forward pass 验证, 接受匹配前缀, 拒绝第一个不匹配及之后
-  - 验证: 验证结果 (accept/reject per position) 与理论一致
-  - 参照: plan Section 3 Phase 6
-
-- [ ] **T8.3** 接受率测量
-  - 内容: 对 3 类 prompt (code/reasoning/conversation) 各跑 100 步, 统计平均接受 token 数
-  - 验证: 平均接受率 >50% (K=4 时 >2 tokens/step)
-  - 参照: plan Section 4 Step 8.3
-
-- [ ] **T8.4** 感知延迟基准
-  - 内容: 对比 speculative decode 开启/关闭时, 用户感知的 token 生成速率 (effective tok/s = 实际输出 token 数 / wall-clock 时间)
-  - 验证: effective tok/s 提升 >2×
-  - 参照: plan Section 3 Phase 6
+- 验证: 单层 < 25ms → interactive prefill 可达 30 tok/s
 
 ---
 
-## Phase 9: Production Hardening
+## Phase D: Xeon Decode 路径实现
 
-参照: `intel_xeon_optimization_plan.md` Section 7
+基于 Phase C 的验证结果, 用选定的算子组装完整的 xeon decode 路径。
 
-- [ ] **T9.1** 编译选项标准化
-  - 内容: Makefile 固化: `-march=native -mprefer-vector-width=512 -O3 -ffast-math -fopenmp -D_GNU_SOURCE`
-  - 验证: 在所有 target (cpu, xeon-bench, xeon-math-test, xeon-op-test) 生效
-  - 参照: plan Section 4 Step 1.3
+### D.1 实现 `ds4_xeon_decode_token`
 
-- [ ] **T9.2** 无 regressions 检查
-  - 内容: 确保 `-cpu`/`-metal`/`-cuda` 后端完全不受影响, 现有测试套件全部通过
-  - 验证: `make test` 全绿
-  - 参照: plan Section 5
+文件: `ds4_xeon.c` (新函数)
+参考: `forward_token_raw_swa_cpu_decode_scratch` (ds4.c:8419) + `layer_forward_raw_swa_one` (ds4.c:8243)
 
-- [ ] **T9.3** 内存泄漏检查
-  - 内容: Valgrind memcheck 或 AddressSanitizer 跑完整 prefill + decode + free
-  - 验证: 零泄漏, 零 use-after-free
-  - 参照: plan Section 4 Step 4.1.2
-
-- [ ] **T9.4** 线程安全验证
-  - 内容: ThreadSanitizer 跑多线程 prefill/decode
-  - 验证: 零 data race
-  - 参照: plan Section 3 Phase 4
-
-- [ ] **T9.5** 性能回归监控
-  - 内容: 建立 CI 基准测试脚本, 记录每次 commit 的 prefill/decode tok/s
-  - 验证: 性能波动 <5% per commit
-  - 参照: plan Section 7
-
----
-
-## 跨阶段依赖关系
-
+完整流程:
 ```
-Phase 1 (Backend + microbench)
-  └─→ Phase 2 (Quantization) ──────────────────────┐
-  └─→ Phase 3 (Dequant + pre-dequant) ─────────────┤
-       └─→ Phase 4 (Static graph + NUMA) ──────────┤
-            └─→ Phase 5 (Engine integration) ──────┤
-                 ├─→ Phase 6 (KV cache) ───────────┤
-                 ├─→ Phase 7 (Expert batching) ────┤
-                 └─→ Phase 8 (Spec decoding) ──────┤
-                                                    └─→ Phase 9 (Hardening)
+1. HC pre (attn) — CPU 路径
+2. RMS norm (attn_norm) — ds4_xeon_rms_norm
+3. INT8 quant norm → ds4_xeon_quantize_a8_per_block
+4. Q projection (LoRA) → VNNI Q8_0 matvec (down + RMSnorm + up)
+5. KV projection → VNNI Q8_0 matvec
+6. RoPE (CPU)
+7. KV cache push + compressor + indexer (CPU, 保持与 KV cache 兼容)
+8. Attention scores → ds4_xeon_attn_scores (修掉 malloc)
+9. Reverse RoPE (CPU)
+10. Output projection (grouped LoRA) → VNNI Q8_0 matvec
+11. HC post (attn) — CPU 路径
+12. HC pre (ffn) — CPU 路径
+13. RMS norm (ffn_norm) → ds4_xeon_rms_norm
+14. INT8 quant → ds4_xeon_quantize_a8_per_block
+15. Router → CPU 路径 (F16 matvec, softmax, top-k)
+16. For each of 6 selected experts:
+    a. ds4_xeon_routed_moe_one_expert (即时反量化, 或预反量化路径)
+17. Shared FFN → VNNI Q8_0 matvec ×3
+18. MoE + Shared 合并
+19. HC post (ffn) — CPU 路径
 ```
 
-Phase 2 和 Phase 3 可并行开发 (分别依赖 Phase 1)。
-Phase 6, 7, 8 可在 Phase 5 基本功能就绪后并行推进。
-Phase 7 (expert batching) 是 prefill 达到目标区间的关键路径。
-Phase 8 (spec decoding) 是 decode 交互体感的关键路径。
+验证:
+- 单层延迟 vs Phase C 预算对比
+- 逐 token 输出 vs `--cpu` 后端完全一致 (100+ tokens)
+
+### D.2 接入 `ds4_session_sync`
+
+文件: `ds4.c` (ds4_session_sync, line 18442-18470)
+- 替换 `forward_token_raw_swa_cpu_decode_scratch` 调用为 `ds4_xeon_decode_token`
+- 保留 checkpoint 逻辑不变
+
+### D.3 Decode 端到端基准
+
+- `./ds4 --backend xeon -p "test" -n 100`
+- 验证: decode tok/s ≥ 5 (IQ2XXS 模型)
+- 如不达标: 回 Phase C 时间表, 找出超预算的算子, 优化
+
+---
+
+## Phase E: Xeon Prefill 路径实现
+
+### E.1 实现 `ds4_xeon_prefill_layer`
+
+文件: `ds4_xeon.c` (新函数)
+参考: `prefill_xeon_graph` (ds4.c:16582) + `prefill_layer_major_cpu` (ds4.c:8479)
+
+关键差异 vs decode:
+- Batch tokens: 需要 batched kernel
+- Token regrouping (Phase 7): 按 expert 分组 token, 每 expert 的权重读取一次, 处理所有已路由 token
+- 预反量化在此场景优势最大: batch token 摊销了 weight DRAM 读取, 预反量化消除 port 5 竞争
+
+流程 (per layer):
+```
+1. Batch HC pre (attn) — CPU 路径 (已有 batch 版本)
+2. Batch RMS norm → ds4_xeon_rms_norm per token
+3. Batch INT8 quant → ds4_xeon_quantize_a8_per_block per token
+4. Batch attention (Q/KV/Output 投影 + scores) — 用 VNNI batch kernel
+5. Batch HC post (attn)
+6. Batch HC pre (ffn)
+7. Batch RMS norm + INT8 quant
+8. Batch router (所有 token)
+9. Token regrouping: 构建 expert → token list 倒排索引 (已有 T7.1)
+10. Per expert, batched GEMM:
+    a. Collect tokens routed to expert e
+    b. ds4_xeon_matmul_a8w8_vnni_batch (gate, 预反量化 uint8 weights)
+    c. ds4_xeon_matmul_a8w8_vnni_batch (up)
+    d. ds4_xeon_swiglu per token
+    e. ds4_xeon_quantize_a16_per_token per token
+    f. ds4_xeon_matmul_a16w16_vnni_batch (down, 预反量化 int16 weights)
+    g. Scatter results to per-token MoE buffer
+11. Batch shared FFN: VNNI Q8_0 batch matmul ×3
+12. MoE + Shared 合并
+13. Batch HC post (ffn)
+```
+
+- 验证: 单层延迟 vs Phase C 预算对比
+- 与 `--cpu` 输出逐 token 一致
+
+### E.2 替换 `prefill_xeon_graph`
+
+文件: `ds4.c` (prefill_xeon_graph, line 16582)
+- 用 `ds4_xeon_prefill_layer` 替代 `layer_attention_raw_swa_batch` + `layer_ffn_batch`
+- 移除 `numa_maps = true` (不再需要 — 等 NUMA 复制实现后再启用)
+- 保留 `f32_cur`/`f32_next` HC state buffer 的使用
+
+### E.3 Prefill 端到端基准
+
+- `./ds4 --backend xeon -p "long test prompt with 32+ tokens" -n 1`
+- 验证: interactive prefill ≥ 30 tok/s
+- `./ds4 --backend xeon -p "$(cat long_prompt.txt)" -n 1` (batch=1024+)
+- 验证: large-batch prefill ≥ 70 tok/s
+
+---
+
+## Phase F: 清理 & 优化
+
+### F.1 移除未使用的 OpenMP 依赖
+
+- `ds4_xeon.c` 的所有 VNNI kernel 中的 `#pragma omp parallel for` 改为 `ds4_parallel_for`
+- Makefile 中移除 `-fopenmp` (如果确认所有 kernel 已迁移)
+- 验证: 编译通过, benchmark 性能无回归
+
+### F.2 NUMA 权重复制 (T4.2.2)
+
+- 前提: 预反量化权重已完成 (Phase B)
+- 实现: 将预反量化的 uint8/int16 权重 memcpy 到 socket 1 本地内存
+- `ds4_xeon_set_numa_maps` 已就绪
+- 验证: `perf stat -e LLC-misses` 对比, NUMA miss 率显著下降
+
+### F.3 线程绑定 (T4.3.1)
+
+- `ds4_xeon_threads_bind` 已实现
+- 在 `ds4_xeon_threads_init` 中调用, 将 pthread pool 线程绑定到 NUMA nodes
+- 确保不与 `ds4_parallel_for` 的 pthread pool 冲突
+
+### F.4 修复 attention scores 的 heap allocation
+
+- `ds4_xeon_attn_scores` (ds4_xeon.c:1047) 中有 `aligned_alloc` + FIXME comment
+- 改为使用预分配的 buffer (来自 ds4_xeon_graph 或 scratch)
+
+### F.5 1GB Hugepage (可选)
+
+- 需要内核 hugetlbfs 配置
+- 如不可用, 用 `MAP_HUGETLB` + fallback 到 2MB transparent hugepage
+
+---
+
+## 进度检查点
+
+每个 Phase 结束后对照目标:
+- [ ] **Phase A 完成**: 每个算子延迟明确, 可知单层最坏时间
+- [ ] **Phase B 完成**: 即时反量化 vs 预反量化决策明确 (decode 用哪个, prefill 用哪个)
+- [ ] **Phase C 完成**: 逐层时间表填满实测数据, 预计 decode tok/s 和 prefill tok/s 明确
+- [ ] **Phase D 完成**: decode ≥ 5 tok/s, token 输出与 CPU 一致
+- [ ] **Phase E 完成**: interactive prefill ≥ 30 tok/s, large-batch prefill ≥ 70 tok/s
+- [ ] **Phase F 完成**: 性能无回归, 无内存泄漏, 无线程竞争
+
+## 偏移检测
+
+如果任何 Phase 的验证不达标:
+1. 回到 Phase C 的时间表, 定位超预算的算子
+2. 优化该算子 (向量化、缓存、算法改进)
+3. 更新 benchmark, 重新验证时间预算
+4. 如果优化后仍不达标, 评估目标是否在当前硬件上可达 (参考 plan Section 2.6 的保守估算)

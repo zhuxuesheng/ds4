@@ -189,6 +189,15 @@ void ds4_xeon_routed_moe_one_expert(
 void ds4_xeon_attn_scores(float *heads, const float *q, const float *raw_kv,
     uint32_t n_tok, uint32_t il);
 
+// RMS Norm: out[i] = in[i] * (1/sqrt(mean(in^2)+eps)) * w[i]
+void ds4_xeon_rms_norm(float *out, const float *in, const float *w, int n, float eps);
+
+// SwiGLU activation: out[i] = sigmoid(x[i]) * x[i] * y[i]
+void ds4_xeon_swiglu(float *out, const float *x, const float *y, int n);
+
+// Vector axpy: y[i] += a * x[i]
+void ds4_xeon_axpy_f32(float *y, const float *x, float a, int n);
+
 // === Activation Quantization ===
 
 // Per-block INT8 quantization (Q8_0 style): 32-element blocks, each with own scale

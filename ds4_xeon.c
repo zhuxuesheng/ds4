@@ -422,7 +422,6 @@ void ds4_xeon_quantize_a8_per_block(int8_t *out, float *scale,
     const int n_blocks = in_dim / block_size;
     const int n16 = block_size / 16;  // 16-element chunks per block
 
-    #pragma omp parallel for
     for (int t = 0; t < n_tok; t++) {
         const float *in_row = in + (uint64_t)t * in_dim;
         int8_t *out_row = out + (uint64_t)t * in_dim;
@@ -474,7 +473,6 @@ void ds4_xeon_quantize_a16_per_token(int16_t *out, float *scale,
 {
     const int n16 = in_dim / 16;
 
-    #pragma omp parallel for
     for (int t = 0; t < n_tok; t++) {
         const float *in_row = in + (uint64_t)t * in_dim;
         int16_t *out_row = out + (uint64_t)t * in_dim;
@@ -878,9 +876,16 @@ void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs
 }
 
 // ============================================================================
-// Q2_K VNNI (scalar inner loop)
+// Q2_K dot product — scalar nibble extraction, auto-vectorized by GCC
 // ============================================================================
-
+// GCC -O3 -march=native auto-vectorizes the inner loop with vpmaddwd.
+// Manual VPDPWSSD attempts were slower because:
+//   1. Store-to-buffer / load-from-buffer round-trip costs
+//   2. 16-element sub-blocks are too small for __m512i (need 32)
+//   3. Per-sub-block scale prevents combining 2 sub-blocks into one VPDPWSSD
+// The real fix for Q2_K performance is pre-dequantization (Phase B),
+// which replaces nibble extraction with direct int16 weight reads.
+// ============================================================================
 void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
     const int16_t *y_i16, const int32_t *y_sum_32, float scale_y)
 {
@@ -895,7 +900,7 @@ void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
         const int32_t *a32_sum = y_sum_32 + (uint64_t)i * (DS4_XEON_QK_K / 32);
 
         for (int j = 0; j < 16; j++) {
-            uint8_t sc_val = sc[j];
+            float sc_val = (float)sc[j];
             const uint8_t *q_ptr = q2 + j * 4;
             int32_t dot = 0;
             for (int k = 0; k < 16; k++) {
@@ -903,7 +908,8 @@ void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
                 uint8_t l = (q_byte >> ((k % 4) * 2)) & 3;
                 dot += (int32_t)l * (int32_t)a16[j * 16 + k];
             }
-            sumf += (d * sc_val) * (float)dot - (dmin * sc_val) * (float)a32_sum[j/2];
+            sumf += d * sc_val * (float)dot
+                  - dmin * sc_val * (float)a32_sum[j / 2];
         }
     }
     *s += sumf;
@@ -914,29 +920,24 @@ void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
 // ============================================================================
 
 void ds4_xeon_rms_norm(float *out, const float *in, const float *w, int n, float eps) {
-    float ss = 0.0f;
-    #pragma omp parallel reduction(+:ss)
-    {
-        __m512 vss = _mm512_setzero_ps();
-        #pragma omp for
-        for (int i = 0; i < n / 16; i++) {
-            __m512 vi = _mm512_loadu_ps(in + i * 16);
-            vss = _mm512_fmadd_ps(vi, vi, vss);
-        }
-        ss += _mm512_reduce_add_ps(vss);
+    __m512 vss = _mm512_setzero_ps();
+    int i16 = (n / 16) * 16;
+    for (int i = 0; i < i16; i += 16) {
+        __m512 vi = _mm512_loadu_ps(in + i);
+        vss = _mm512_fmadd_ps(vi, vi, vss);
     }
-    for (int i = (n / 16) * 16; i < n; i++) ss += in[i] * in[i];
+    float ss = _mm512_reduce_add_ps(vss);
+    for (int i = i16; i < n; i++) ss += in[i] * in[i];
 
     float scale = 1.0f / sqrtf(ss / (float)n + eps);
     __m512 vscale = _mm512_set1_ps(scale);
 
-    #pragma omp parallel for
-    for (int i = 0; i < n / 16; i++) {
-        __m512 vi = _mm512_loadu_ps(in + i * 16);
-        __m512 vw = _mm512_loadu_ps(w + i * 16);
-        _mm512_storeu_ps(out + i * 16, _mm512_mul_ps(_mm512_mul_ps(vi, vscale), vw));
+    for (int i = 0; i < i16; i += 16) {
+        __m512 vi = _mm512_loadu_ps(in + i);
+        __m512 vw = _mm512_loadu_ps(w + i);
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(_mm512_mul_ps(vi, vscale), vw));
     }
-    for (int i = (n / 16) * 16; i < n; i++) {
+    for (int i = i16; i < n; i++) {
         out[i] = in[i] * scale * w[i];
     }
 }
@@ -1124,18 +1125,26 @@ void ds4_xeon_axpy_f32(float *y, const float *x, float a, int n) {
 // ============================================================================
 
 void ds4_xeon_swiglu(float *out, const float *x, const float *y, int n) {
-    #pragma omp parallel for
-    for (int i = 0; i < n; i += 16) {
-        int rem = n - i;
-        int chunk = rem < 16 ? rem : 16;
+    int i16 = (n / 16) * 16;
+    for (int i = 0; i < i16; i += 16) {
+        __m512 vx = _mm512_loadu_ps(x + i);
+        __m512 vy = _mm512_loadu_ps(y + i);
+        /* sigmoid(x) = 1/(1+exp(-x)).  Compute sigmoid(x) * x * y.
+         * AVX-512 has no native exp, so we store, compute scalar expf,
+         * reload.  The 16 expf calls dominate; the SIMD mul/add avoids
+         * port pressure on the surrounding arithmetic. */
         float xv[16], yv[16];
-        for (int j = 0; j < chunk; j++) {
-            xv[j] = x[i + j];
-            yv[j] = y[i + j];
+        _mm512_storeu_ps(xv, vx);
+        _mm512_storeu_ps(yv, vy);
+        for (int j = 0; j < 16; j++) {
+            float sx = 1.0f / (1.0f + expf(-xv[j]));
+            xv[j] = sx * xv[j] * yv[j];
         }
-        for (int j = 0; j < chunk; j++) {
-            out[i + j] = xv[j] * (1.0f / (1.0f + expf(-xv[j]))) * yv[j];
-        }
+        _mm512_storeu_ps(out + i, _mm512_loadu_ps(xv));
+    }
+    for (int i = i16; i < n; i++) {
+        float sx = 1.0f / (1.0f + expf(-x[i]));
+        out[i] = sx * x[i] * y[i];
     }
 }
 
