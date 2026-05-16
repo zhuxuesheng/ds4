@@ -16692,18 +16692,91 @@ static void ds4_xeon_decode_token(
         int                 token,
         uint32_t            pos)
 {
-    /* Delegate to CPU path for correctness baseline.
-     * VNNI optimizations will be incrementally added:
-     *   Step 1: Replace MoE FFN with VNNI (verify correctness)
-     *   Step 2: Replace attention Q/KV with VNNI (verify correctness)
-     *   Step 3: Add ds4_parallel_for parallelism (verify speed) */
-    forward_token_raw_swa_cpu_decode_scratch(logits,
-        &e->model, &e->weights, &s->cpu_cache,
-        token, pos,
-        e->directional_steering_dirs,
-        e->directional_steering_attn_scale,
-        e->directional_steering_ffn_scale,
-        &s->cpu_scratch);
+    ds4_cpu_decode_scratch *scratch = &s->cpu_scratch;
+    float *cur = scratch->cur;
+    float *next = scratch->next;
+
+    embed_token_f16(&e->model, &e->weights, token, scratch->plain);
+    hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *lw = &e->weights.layer[il];
+        ds4_layer_cache *cache = &s->cpu_cache.layer[il];
+
+        /* === CPU Attention (exact copy from layer_forward_raw_swa_one) === */
+        float post[4], comb[16];
+        memcpy(scratch->attn_residual, cur,
+               sizeof(float) * DS4_N_HC * DS4_N_EMBD);
+        hc_pre_from_state_one_scratch(&e->model,
+            lw->hc_attn_fn, lw->hc_attn_scale, lw->hc_attn_base,
+            scratch->attn_residual, scratch->attn_cur, post, comb,
+            scratch->hc_flat, false);
+        layer_attn_norm_one(scratch->attn_norm, &e->model, lw, scratch->attn_cur);
+        const uint32_t ratio = cache->compress_ratio;
+        layer_q_projection_with_lora_one_decode_scratch(&e->model, lw,
+            scratch->attn_norm, scratch->q, scratch->qr_norm, scratch);
+        layer_kv_projection_normed_one_decode_scratch(&e->model, lw,
+            scratch->attn_norm, scratch->kv, scratch);
+        rope_tail_layer_inplace(scratch->q, DS4_N_HEAD, DS4_N_HEAD_DIM,
+            DS4_N_ROT, pos, il, false);
+        rope_tail_layer_inplace(scratch->kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+            DS4_N_ROT, pos, il, false);
+        dsv4_fp8_kv_quantize_row_inplace_cpu(scratch->kv, DS4_N_HEAD_DIM, DS4_N_ROT);
+        kv_cache_push_raw(cache, scratch->kv);
+        bool *comp_allowed = NULL;
+        if (ratio != 0) {
+            if (compressor_decode_one_decode_scratch(scratch->comp, &e->model,
+                lw->attn_compressor_kv, lw->attn_compressor_gate,
+                lw->attn_compressor_ape, lw->attn_compressor_norm,
+                scratch->attn_norm,
+                cache->attn_state_kv, cache->attn_state_score,
+                DS4_N_HEAD_DIM, ratio, il, pos, scratch)) {
+                kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp,
+                    cache->comp_cap, DS4_N_HEAD_DIM, scratch->comp);
+            }
+            if (ratio == 4) {
+                if (compressor_decode_one_decode_scratch(scratch->index_comp, &e->model,
+                    lw->indexer_compressor_kv, lw->indexer_compressor_gate,
+                    lw->indexer_compressor_ape, lw->indexer_compressor_norm,
+                    scratch->attn_norm,
+                    cache->index_state_kv, cache->index_state_score,
+                    DS4_N_INDEXER_HEAD_DIM, ratio, il, pos, scratch)) {
+                    kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp,
+                        cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, scratch->index_comp);
+                }
+            }
+        }
+        if (ratio == 4)
+            comp_allowed = indexer_allowed_decode_one_decode_scratch(&e->model, lw,
+                scratch->attn_norm, scratch->qr_norm,
+                cache->index_comp_kv, cache->n_index_comp, il, pos, scratch);
+        if (ratio != 0)
+            layer_attention_mixed_one_decode_scratch(scratch->heads, &e->model, lw,
+                scratch->q, cache->raw_kv, cache->n_raw,
+                cache->attn_comp_kv, cache->n_comp, comp_allowed, scratch);
+        else
+            layer_attention_rows_one(scratch->heads, &e->model, lw, scratch->q,
+                cache->raw_kv, cache->n_raw);
+        rope_tail_layer_inplace(scratch->heads, DS4_N_HEAD, DS4_N_HEAD_DIM,
+            DS4_N_ROT, pos, il, true);
+        layer_grouped_out_one_decode_scratch(scratch->attn_out, &e->model, lw,
+            scratch->heads, scratch);
+        hc_post_one(scratch->after_attn_hc, scratch->attn_out,
+            scratch->attn_residual, post, comb, DS4_N_EMBD, DS4_N_HC);
+
+        /* === FFN: CPU path === */
+        layer_ffn_one_decode_scratch(next, &e->model, lw,
+            scratch->after_attn_hc, il, token,
+            e->directional_steering_dirs,
+            e->directional_steering_ffn_scale,
+            scratch);
+
+        { float *tmp = cur; cur = next; next = tmp; }
+    }
+
+    output_logits_one_decode_scratch(logits, &e->model, &e->weights, cur, scratch);
+    scratch->cur = cur;
+    scratch->next = next;
 }
 
 /* Original xeon per-layer implementation kept as reference for VNNI migration.
@@ -16748,7 +16821,7 @@ static void ds4_xeon_decode_token_vnni(
             float act_scale;
             ds4_xeon_quantize_a16_per_token(act_i16, &act_scale,
                 scratch->attn_norm, 1, DS4_N_EMBD);
-            act_scale = 1.0f / act_scale;
+            /* act_scale from quantize is max_val/32767, correct for dot */
 
             /* Q down: 4096→1024 */
             float q_down[DS4_N_LORA_Q] __attribute__((aligned(64)));
@@ -16784,7 +16857,7 @@ static void ds4_xeon_decode_token_vnni(
             float act_scale;
             ds4_xeon_quantize_a16_per_token(act_i16, &act_scale,
                 scratch->attn_norm, 1, DS4_N_EMBD);
-            act_scale = 1.0f / act_scale;
+            /* act_scale from quantize is max_val/32767, correct for dot */
 
             q80_ctx ctx = {scratch->kv, act_i16, act_scale,
                 tensor_data(&e->model, lw->attn_kv), DS4_N_EMBD};
@@ -16915,7 +16988,7 @@ static void ds4_xeon_decode_token_vnni(
             float act_scale;
             ds4_xeon_quantize_a16_per_token(act_i16, &act_scale,
                 scratch->ffn_norm, 1, DS4_N_EMBD);
-            act_scale = 1.0f / act_scale;
+            /* act_scale from quantize is max_val/32767, correct for dot */
 
             /* gate: 2048 rows via ds4_parallel_for */
             gateup_ctx gctx = {gate, gate_raw, gate_rb, act_i16, act_scale};

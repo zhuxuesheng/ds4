@@ -174,6 +174,9 @@ xeon-op-bench:
 	$(CC) $(CFLAGS) -mprefer-vector-width=512 -fopenmp -o tests/ds4_xeon_op_bench tests/ds4_xeon_op_bench.c ds4_xeon.c $(LDLIBS)
 	./tests/ds4_xeon_op_bench
 xeon-predequant-bench:
+xeon-gateup-test:
+	$(CC) $(CFLAGS) -mprefer-vector-width=512 -fopenmp -o tests/ds4_xeon_gateup_test tests/ds4_xeon_gateup_test.c ds4_xeon.c -lm
+	./tests/ds4_xeon_gateup_test
 	$(CC) $(CFLAGS) -mprefer-vector-width=512 -fopenmp -o tests/ds4_xeon_predequant_bench tests/ds4_xeon_predequant_bench.c ds4_xeon.c $(LDLIBS)
 	./tests/ds4_xeon_predequant_bench
 xeon-decode-bench:

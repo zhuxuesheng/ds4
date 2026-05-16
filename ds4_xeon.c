@@ -991,7 +991,7 @@ void ds4_xeon_routed_moe_one_expert(
     // Quantize input to int16 for IQ2XXS dot products
     float act_scale;
     ds4_xeon_quantize_a16_per_token(act_i16, &act_scale, x, 1, DS4_N_EMBD);
-    act_scale = 1.0f / act_scale;
+    /* act_scale from quantize is max_val/32767, correct for dot */
 
     // Gate projection: [DS4_N_EMBD] → [DS4_N_FF_EXP]  (2048 rows)
     for (uint32_t r = 0; r < DS4_N_FF_EXP; r++) {
