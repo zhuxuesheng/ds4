@@ -1648,17 +1648,54 @@ void ds4_xeon_threads_bind(int numa_node) {
 
 void ds4_xeon_threads_init(void) {
     int nn = ds4_xeon_numa_init();
-    if (nn > 0) {
-        ds4_xeon_threads_bind(0);
-    } else {
+    if (nn <= 0) {
         #pragma omp parallel
         {
             #pragma omp master
-            {
-                int nth = omp_get_num_threads();
-                fprintf(stderr, "ds4: Xeon backend initialized "
-                        "(AVX-512 VNNI, %d threads)\n", nth);
+            fprintf(stderr, "ds4: Xeon backend initialized (AVX-512 VNNI, %d threads)\n",
+                    omp_get_num_threads());
+        }
+        return;
+    }
+
+    // Build per-node CPU sets from sysfs
+    cpu_set_t *node_cpus[16] = {0};
+    int node_ncpu[16] = {0};
+    for (int n = 0; n < nn && n < 16; n++) {
+        node_ncpu[n] = numa_node_to_cpuset(n, &node_cpus[n]);
+    }
+
+    // Stripe OpenMP threads across NUMA nodes
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nth = omp_get_num_threads();
+        int node = tid % nn;
+
+        if (node_cpus[node] && node_ncpu[node] > 0) {
+            // Assign thread tid to the (tid/nn)-th CPU in its node's set
+            int node_thread_idx = tid / nn;
+            int cpu_idx = 0, assigned = -1;
+            for (int c = 0; c < CPU_SETSIZE; c++) {
+                if (CPU_ISSET_S(c, CPU_ALLOC_SIZE(CPU_SETSIZE), node_cpus[node])) {
+                    if (cpu_idx == node_thread_idx % node_ncpu[node]) {
+                        assigned = c; break;
+                    }
+                    cpu_idx++;
+                }
+            }
+            if (assigned >= 0) {
+                cpu_set_t *ts = CPU_ALLOC(CPU_SETSIZE);
+                CPU_ZERO_S(CPU_ALLOC_SIZE(CPU_SETSIZE), ts);
+                CPU_SET_S(assigned, CPU_ALLOC_SIZE(CPU_SETSIZE), ts);
+                pthread_setaffinity_np(pthread_self(), CPU_ALLOC_SIZE(CPU_SETSIZE), ts);
+                CPU_FREE(ts);
             }
         }
+
+        #pragma omp master
+        fprintf(stderr, "ds4: %d threads striped across %d NUMA nodes\n", nth, nn);
     }
+
+    for (int n = 0; n < nn; n++) CPU_FREE(node_cpus[n]);
 }
