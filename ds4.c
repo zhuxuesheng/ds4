@@ -6598,28 +6598,11 @@ static void layer_ffn_one_decode_scratch(
         memset(scratch->ffn_moe, 0, DS4_N_EMBD * sizeof(float));
         block_q8_K *xq = scratch->routed_xq;
         ds4_quantize_row_q8_K(scratch->ffn_norm, xq, (int64_t)DS4_N_EMBD);
-        /* VNNI gate/up: extract Q8_K from xq for IQ2XXS VNNI */
-        const int nb_in = DS4_N_EMBD / QK_K;
-        const uint64_t grb = 66ULL * nb_in;
-        int8_t a8f[DS4_N_EMBD] __attribute__((aligned(64)));
-        float a8s[nb_in];
-        for (int b = 0; b < nb_in; b++) {
-            a8s[b] = xq[b].d; memcpy(a8f + b*QK_K, xq[b].qs, QK_K);
-        }
-        const uint8_t *gbase = (const uint8_t*)tensor_data(model, layer->ffn_gate_exps);
-        const uint8_t *ubase = (const uint8_t*)tensor_data(model, layer->ffn_up_exps);
         for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
             float cg[DS4_N_FF_EXP], cu[DS4_N_FF_EXP];
-            {
-                gateup_q8k_ctx gctx = {
-                    .gate_out = cg, .up_out = cu,
-                    .gate_blocks = gbase + (uint64_t)sel[ei] * DS4_N_FF_EXP * grb,
-                    .up_blocks   = ubase + (uint64_t)sel[ei] * DS4_N_FF_EXP * grb,
-                    .row_bytes = grb,
-                    .act_q8 = a8f, .act_scale = a8s,
-                };
-                ds4_parallel_for(DS4_N_FF_EXP, gateup_q8k_worker, &gctx);
-            }
+            /* CPU native gate/up (already parallel via ds4_parallel_for) */
+            matvec_iq2_xxs_expert_pair_prequant(cg, cu, model,
+                layer->ffn_gate_exps, layer->ffn_up_exps, xq, (uint32_t)sel[ei]);
             /* SwiGLU */
             for (int j = 0; j < DS4_N_FF_EXP; j++) {
                 float g = cg[j];
