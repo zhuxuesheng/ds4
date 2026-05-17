@@ -986,7 +986,7 @@ void ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(int n, float *s,
                 block_acc += _mm512_reduce_add_epi32(scaledU);
             }
         }
-        sumf += dw * q8_d * (float)block_acc;
+        sumf += dw * q8_d * (float)block_acc * (1.0f/8.0f);
     }
     *s += sumf;
 }

@@ -4530,7 +4530,7 @@ static void matvec_iq2_xxs_pair_worker(void *vctx, uint64_t row0, uint64_t row1)
 
 /* Project one routed expert's gate and up matrices.  Both are IQ2_XXS and
  * share the same Q8_K activation. */
-void matvec_iq2_xxs_expert_pair_prequant(
+static void matvec_iq2_xxs_expert_pair_prequant(
         float            *out0,
         float            *out1,
         const ds4_model  *m,
@@ -4717,7 +4717,7 @@ static void matvec_q2_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
 
 /* Accumulate all selected experts' Q2_K down projections directly into the
  * 4096-wide MoE output. */
-void matvec_q2_k_experts_accum_prequant(
+static void matvec_q2_k_experts_accum_prequant(
         float            *out,
         const ds4_model  *m,
         const ds4_tensor *w,
@@ -6481,7 +6481,7 @@ static void layer_ffn_one(
     free(ffn_cur);
 }
 
-/* Q8_K down worker for ds4_parallel_for — VNNI Q2_K dot over row range */
+/* Q8_K down worker for ds4_parallel_for */
 typedef struct {
     float *restrict out;
     const uint8_t *down_blocks;
@@ -6555,10 +6555,28 @@ static void layer_ffn_one_decode_scratch(
         memset(scratch->ffn_moe, 0, DS4_N_EMBD * sizeof(float));
         block_q8_K *xq = scratch->routed_xq;
         ds4_quantize_row_q8_K(scratch->ffn_norm, xq, (int64_t)DS4_N_EMBD);
+        /* VNNI gate/up: extract Q8_K from xq for IQ2XXS VNNI */
+        const int nb_in = DS4_N_EMBD / QK_K;
+        const uint64_t grb = 66ULL * nb_in;
+        int8_t a8f[DS4_N_EMBD] __attribute__((aligned(64)));
+        float a8s[nb_in];
+        for (int b = 0; b < nb_in; b++) {
+            a8s[b] = xq[b].d; memcpy(a8f + b*QK_K, xq[b].qs, QK_K);
+        }
+        const uint8_t *gbase = (const uint8_t*)tensor_data(model, layer->ffn_gate_exps);
+        const uint8_t *ubase = (const uint8_t*)tensor_data(model, layer->ffn_up_exps);
         for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
             float cg[DS4_N_FF_EXP], cu[DS4_N_FF_EXP];
-            matvec_iq2_xxs_expert_pair_prequant(cg, cu, model,
-                layer->ffn_gate_exps, layer->ffn_up_exps, xq, (uint32_t)sel[ei]);
+            const uint8_t *ge = gbase + (uint64_t)sel[ei] * DS4_N_FF_EXP * grb;
+            const uint8_t *ue = ubase + (uint64_t)sel[ei] * DS4_N_FF_EXP * grb;
+            for (uint32_t r = 0; r < DS4_N_FF_EXP; r++) {
+                float gd = 0, ud = 0;
+                ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(DS4_N_EMBD, &gd,
+                    (const ds4_xeon_block_iq2_xxs*)(ge + r*grb), a8f, a8s);
+                ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(DS4_N_EMBD, &ud,
+                    (const ds4_xeon_block_iq2_xxs*)(ue + r*grb), a8f, a8s);
+                cg[r] = gd; cu[r] = ud;
+            }
             /* SwiGLU */
             for (int j = 0; j < DS4_N_FF_EXP; j++) {
                 float g = cg[j];
@@ -6579,16 +6597,12 @@ static void layer_ffn_one_decode_scratch(
             const uint8_t *down_base = (const uint8_t*)tensor_data(
                 model, layer->ffn_down_exps);
             const uint8_t *de = down_base + (uint64_t)sel[ei] * DS4_N_EMBD * drb;
-            /* Parallel down projection via ds4_parallel_for */
             {
                 down_q8k_ctx dctx = {
                     .out = scratch->ffn_moe,
-                    .down_blocks = de,
-                    .row_bytes = drb,
-                    .mid_q8 = mq8,
-                    .mid_scale = mqs,
-                    .ew = ew[ei],
-                    .n_ff = DS4_N_FF_EXP,
+                    .down_blocks = de, .row_bytes = drb,
+                    .mid_q8 = mq8, .mid_scale = mqs,
+                    .ew = ew[ei], .n_ff = DS4_N_FF_EXP,
                 };
                 ds4_parallel_for(DS4_N_EMBD, down_q8k_worker, &dctx);
             }
