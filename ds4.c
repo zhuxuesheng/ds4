@@ -6481,6 +6481,25 @@ static void layer_ffn_one(
     free(ffn_cur);
 }
 
+/* Pre-dequant down worker types (implemented in ds4_xeon.c) */
+typedef struct dq_down_dequant_ctx {
+    int16_t *restrict dst;
+    const uint8_t *src;
+    uint64_t row_bytes;
+    int n_ff;
+} dq_down_dequant_ctx;
+void dq_down_dequant_worker(void *vctx, uint64_t row0, uint64_t row1);
+
+typedef struct dq_down_matvec_ctx {
+    float *restrict out;
+    const int16_t *w16;
+    const int8_t *mid_q8;
+    const float *mid_scale;
+    float ew;
+    int n_ff;
+} dq_down_matvec_ctx;
+void dq_down_matvec_worker(void *vctx, uint64_t row0, uint64_t row1);
+
 /* Q8_K gate/up worker for ds4_parallel_for */
 typedef struct {
     float *restrict gate_out, *restrict up_out;

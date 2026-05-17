@@ -992,15 +992,68 @@ void ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(int n, float *s,
 }
 
 // ============================================================================
+// Pre-dequantized Q2_K down matvec (VPDPWSSD over pre-dequant int16 weights)
+// ============================================================================
+// Dequantizes one expert's Q2_K down weights (4096×2048) to int16, then uses
+// simple VPDPWSSD matvec with Q8_K activation.  Much faster than on-the-fly
+// nibble extraction since weight d/dmin/sc are baked into the int16 values
+// at dequant time.
+
+/* Context for parallel dequant of one expert's down weights */
+typedef struct {
+    int16_t *restrict dst;
+    const uint8_t *src;
+    uint64_t row_bytes;
+    int n_ff;
+} dq_down_dequant_ctx;
+
+void dq_down_dequant_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    dq_down_dequant_ctx *ctx = (dq_down_dequant_ctx*)vctx;
+    const int nb = ctx->n_ff / DS4_XEON_QK_K; /* 8 */
+    for (uint64_t r = row0; r < row1; r++) {
+        const ds4_xeon_block_q2_K *blk =
+            (const ds4_xeon_block_q2_K*)(ctx->src + r * ctx->row_bytes);
+        int16_t *dst = ctx->dst + r * ctx->n_ff;
+        for (int b = 0; b < nb; b++)
+            ds4_xeon_dequant_q2k_block_to_i16(dst + b * DS4_XEON_QK_K, blk + b);
+    }
+}
+
+typedef struct {
+    float *restrict out;
+    const int16_t *w16;
+    const int8_t *mid_q8;
+    const float *mid_scale;
+    float ew;
+    int n_ff;
+} dq_down_matvec_ctx;
+
+void dq_down_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    dq_down_matvec_ctx *ctx = (dq_down_matvec_ctx*)vctx;
+    const int nb = ctx->n_ff / DS4_XEON_QK_K;
+    for (uint64_t r = row0; r < row1; r++) {
+        const int16_t *wr = ctx->w16 + r * ctx->n_ff;
+        float dot = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            const int16_t *wb = wr + b * DS4_XEON_QK_K;
+            const int8_t  *ab = ctx->mid_q8 + b * DS4_XEON_QK_K;
+            float sc = ctx->mid_scale[b];
+            __m512i acc = _mm512_setzero_si512();
+            for (int j = 0; j < DS4_XEON_QK_K; j += 32) {
+                __m256i a8v = _mm256_loadu_si256((const __m256i*)(ab + j));
+                __m512i a16 = _mm512_cvtepi8_epi16(a8v);
+                __m512i wv  = _mm512_loadu_si512((const __m512i*)(wb + j));
+                acc = _mm512_dpwssd_epi32(acc, wv, a16);
+            }
+            dot += sc * (float)_mm512_reduce_add_epi32(acc);
+        }
+        ctx->out[r] += ctx->ew * dot;
+    }
+}
+
+// ============================================================================
 // Q2_K dot product — scalar nibble extraction, auto-vectorized by GCC
 // ============================================================================
-// GCC -O3 -march=native auto-vectorizes the inner loop with vpmaddwd.
-// Manual VPDPWSSD attempts were slower because:
-//   1. Store-to-buffer / load-from-buffer round-trip costs
-//   2. 16-element sub-blocks are too small for __m512i (need 32)
-//   3. Per-sub-block scale prevents combining 2 sub-blocks into one VPDPWSSD
-// The real fix for Q2_K performance is pre-dequantization (Phase B),
-// which replaces nibble extraction with direct int16 weight reads.
 // ============================================================================
 void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
     const int16_t *y_i16, const int32_t *y_sum_32, float scale_y)
@@ -1842,8 +1895,9 @@ void ds4_xeon_dequant_q2k_block_to_i16(
     const __m512 vm32768 = _mm512_set1_ps(-32768.0f);
 
     for (int j = 0; j < 16; j++) {
-        const float sc_val = d * (float)sc[j];
-        const float m_val  = dmin * (float)sc[j];
+        const float sc_lo  = (float)(sc[j] & 0x0F);
+        const float sc_val = d * sc_lo;
+        const float m_val  = dmin * sc_lo;
         const __m512 v_sc = _mm512_set1_ps(sc_val);
         const __m512 v_m  = _mm512_set1_ps(m_val);
         const uint8_t *q_ptr = qs + j * 4;
