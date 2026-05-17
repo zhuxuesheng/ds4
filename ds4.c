@@ -6481,6 +6481,29 @@ static void layer_ffn_one(
     free(ffn_cur);
 }
 
+/* Q8_K down worker for ds4_parallel_for — VNNI Q2_K dot over row range */
+typedef struct {
+    float *restrict out;
+    const uint8_t *down_blocks;
+    uint64_t row_bytes;
+    const int8_t *mid_q8;
+    const float *mid_scale;
+    float ew;
+    int n_ff;
+} down_q8k_ctx;
+
+static void down_q8k_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    down_q8k_ctx *ctx = (down_q8k_ctx*)vctx;
+    for (uint64_t r = row0; r < row1; r++) {
+        const ds4_xeon_block_q2_K *blk =
+            (const ds4_xeon_block_q2_K*)(ctx->down_blocks + r * ctx->row_bytes);
+        float d = 0.0f;
+        ds4_xeon_vec_dot_q2_K_q8k_vnni(ctx->n_ff, &d, blk,
+            ctx->mid_q8, ctx->mid_scale);
+        ctx->out[r] += ctx->ew * d;
+    }
+}
+
 /* Allocation-free decode FFN using the persistent CPU scratch buffers. */
 static void layer_ffn_one_decode_scratch(
         float                  * out_hc,
@@ -6556,12 +6579,18 @@ static void layer_ffn_one_decode_scratch(
             const uint8_t *down_base = (const uint8_t*)tensor_data(
                 model, layer->ffn_down_exps);
             const uint8_t *de = down_base + (uint64_t)sel[ei] * DS4_N_EMBD * drb;
-            for (uint32_t r = 0; r < DS4_N_EMBD; r++) {
-                float d = 0;
-                const ds4_xeon_block_q2_K *blk =
-                    (const ds4_xeon_block_q2_K*)(de + r * drb);
-                ds4_xeon_vec_dot_q2_K_q8k_vnni(DS4_N_FF_EXP, &d, blk, mq8, mqs);
-                scratch->ffn_moe[r] += ew[ei] * d;
+            /* Parallel down projection via ds4_parallel_for */
+            {
+                down_q8k_ctx dctx = {
+                    .out = scratch->ffn_moe,
+                    .down_blocks = de,
+                    .row_bytes = drb,
+                    .mid_q8 = mq8,
+                    .mid_scale = mqs,
+                    .ew = ew[ei],
+                    .n_ff = DS4_N_FF_EXP,
+                };
+                ds4_parallel_for(DS4_N_EMBD, down_q8k_worker, &dctx);
             }
         }
     } else
