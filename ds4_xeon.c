@@ -1170,6 +1170,7 @@ void ds4_xeon_routed_moe_one_expert(
         }
     }
 
+    static int tr = 0;
     // Gate projection: [DS4_N_EMBD] → [DS4_N_FF_EXP] using Q8_K VNNI
     for (uint32_t r = 0; r < DS4_N_FF_EXP; r++) {
         const ds4_xeon_block_iq2_xxs *blocks =
@@ -1188,6 +1189,11 @@ void ds4_xeon_routed_moe_one_expert(
         ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(DS4_N_EMBD, &dot, blocks,
             act_q8, act_q8_scale);
         up[r] = dot;
+    }
+    if (!tr) {
+        fprintf(stderr, "ds4_xeon: MOE gate[0]=%.6e up[0]=%.6e act_sc[0]=%.6e\n",
+            (double)gate[0], (double)up[0], (double)act_q8_scale[0]);
+        tr = 1;
     }
 
     // SwiGLU: mid = SiLU(gate) * up
