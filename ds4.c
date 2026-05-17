@@ -16722,6 +16722,7 @@ static void ds4_xeon_ffn_ab_compare(
 
     /* --- CPU MoE (trace style, per-expert) --- */
     float cpu_moe[DS4_N_EMBD];
+    float cpu_gate0 = 0.0f; /* first row of first expert gate, for debug */
     memset(cpu_moe, 0, sizeof(cpu_moe));
     {
         block_q8_K *xq = scratch->routed_xq;
@@ -16733,6 +16734,7 @@ static void ds4_xeon_ffn_ab_compare(
             matvec_iq2_xxs_expert_pair_prequant(gate, up, model,
                 layer->ffn_gate_exps, layer->ffn_up_exps, xq,
                 (uint32_t)eid);
+            if (ei == 0) cpu_gate0 = gate[0];
             /* SwiGLU: mid = SiLU(gate) * up */
             for (int j = 0; j < DS4_N_FF_EXP; j++) {
                 float g = gate[j];
@@ -16750,6 +16752,24 @@ static void ds4_xeon_ffn_ab_compare(
             for (int j = 0; j < DS4_N_EMBD; j++)
                 cpu_moe[j] += ew * down_out[j];
         }
+    }
+
+    /* --- VNNI gate[0] comparison (independent of full MoE) --- */
+    {
+        int eid0 = selected[0];
+        const uint64_t grb = 66ULL * (DS4_N_EMBD / QK_K);
+        const uint8_t *gb = (const uint8_t*)tensor_data(
+            model, layer->ffn_gate_exps)
+            + (uint64_t)eid0 * DS4_N_FF_EXP * grb;
+        int16_t a16[DS4_N_EMBD] __attribute__((aligned(64)));
+        float a16_sc;
+        ds4_xeon_quantize_a16_per_token(a16, &a16_sc, saved_norm, 1, DS4_N_EMBD);
+        float vnni_gate0 = 0.0f;
+        ds4_xeon_vec_dot_iq2_xxs_vnni(DS4_N_EMBD, &vnni_gate0,
+            (const ds4_xeon_block_iq2_xxs*)gb, a16, a16_sc);
+        fprintf(stderr, "ds4: [AB l%u] eid=%d gate[0] cpu=%.6e vnni=%.6e diff=%.2e\n",
+            il, eid0, (double)cpu_gate0, (double)vnni_gate0,
+            fabs((double)cpu_gate0 - (double)vnni_gate0));
     }
 
     /* --- VNNI MoE (per-expert, on-the-fly) --- */
