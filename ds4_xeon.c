@@ -843,6 +843,23 @@ void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs
                 mask[qi] = iq2xxs_sign_mask_lut[ksigns_iq2xs[si16[qi * 2]]];
             }
 
+            /* One-time debug: print first block details */
+            {
+                static int done = 0;
+                if (i == 0 && j == 0 && !done) {
+                    done = 1;
+                    uint16_t q0 = qs[0];
+                    uint8_t gi0 = q0 & 0xFF, si0 = (q0 >> 8) & 0x7F;
+                    uint8_t ks  = ksigns_iq2xs[si0];
+                    uint64_t gv = iq2xxs_grid[gi0];
+                    fprintf(stderr, "ds4_xeon: IQ2XXS dbg q[0]=0x%04x gi=%u si=%u "
+                        "ksigns_iq2xs[%u]=0x%02x grid[%u]=0x%016lx "
+                        "mask[0]=0x%016lx d_raw=0x%04x a16[0]=%d\n",
+                        q0, gi0, si0, si0, ks, gi0, gv, mask[0],
+                        x[i].d, (int)a16[0]);
+                }
+            }
+
             // Load raw int8 weights and negation mask
             __m512i w8_raw = _mm512_loadu_si512((const __m512i*)gl);
             __m512i m8 = _mm512_loadu_si512((const __m512i*)mask);
