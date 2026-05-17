@@ -45,6 +45,7 @@
 // when linked with ds4.c the strong definitions take precedence.
 __attribute__((weak)) const uint8_t ksigns_iq2xs[128] = {0};
 __attribute__((weak)) const uint64_t iq2xxs_grid[256] = {0};
+__attribute__((weak)) int8_t iq2xxs_signs[128][8];
 
 // ============================================================================
 // Utility
@@ -886,48 +887,104 @@ void ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(int n, float *s,
     const ds4_xeon_block_iq2_xxs *x,
     const int8_t *q8, const float *q8_scale)
 {
+    /* Matches the CPU native IQ2XXS format from ds4_vec_dot_iq2_xxs_pair_q8_K.
+     * Each block of 256 weights is 32 uint16 qs entries processed in 4 batches
+     * of 8 entries (64 weights) each.  Within a batch, Pair 0 uses qs[0..3] for
+     * 32 weights and Pair 1 uses qs[4..7] for another 32 weights.
+     *
+     * Grid indices come from even qs entries (0,1,4,5 per batch).
+     * Sign indices (7-bit) packed in odd qs entries (2,3,6,7 per batch) at
+     * bits 0,7,14,21.  Scale factor at bits 28-31 of qs[3]/qs[7]: ls=2*bits+1.
+     */
     const int nb = n / DS4_XEON_QK_K;
     float sumf = 0.0f;
     for (int i = 0; i < nb; i++) {
         const float q8_d = q8_scale[i];
-        const float d     = xeon_f16_to_f32(x[i].d) * q8_d;
+        const float dw   = xeon_f16_to_f32(x[i].d);
         const uint16_t *qs = x[i].qs;
         const int8_t  *a8  = q8 + (uint64_t)i * DS4_XEON_QK_K;
-        int32_t acc = 0;
 
-        for (int j = 0; j < 32; j += 8) {
-            __m128i qv = _mm_loadu_si128((const __m128i*)(qs + j));
-            __m256i lo32 = _mm256_cvtepu16_epi32(
-                _mm_and_si128(qv, _mm_set1_epi16(0xFF)));
-            __m512i g64 = _mm512_i32gather_epi64(lo32,
-                (const void*)iq2xxs_grid, 8);
-            __m128i hi8 = _mm_and_si128(
-                _mm_srli_epi16(qv, 8), _mm_set1_epi16(0x7F));
-            uint64_t gl[8];
-            _mm512_storeu_si512((__m512i*)gl, g64);
-            uint8_t si16[16];
-            _mm_storeu_si128((__m128i*)si16, hi8);
-            uint64_t mask[8];
-            for (int qi = 0; qi < 8; qi++)
-                mask[qi] = iq2xxs_sign_mask_lut[ksigns_iq2xs[si16[qi * 2]]];
-            __m512i w8_raw = _mm512_loadu_si512((const __m512i*)gl);
-            __m512i m8 = _mm512_loadu_si512((const __m512i*)mask);
-            __m512i w8_signed = _mm512_sub_epi8(
-                _mm512_xor_si512(w8_raw, m8), m8);
-            __m256i w8_lo = _mm512_castsi512_si256(w8_signed);
-            __m256i w8_hi = _mm512_extracti64x4_epi64(w8_signed, 1);
-            __m512i w16_lo = _mm512_cvtepi8_epi16(w8_lo);
-            __m512i w16_hi = _mm512_cvtepi8_epi16(w8_hi);
-            __m256i a8_lo = _mm256_loadu_si256((const __m256i*)(a8 + j * 8));
-            __m256i a8_hi = _mm256_loadu_si256((const __m256i*)(a8 + j * 8 + 32));
-            __m512i a16_lo = _mm512_cvtepi8_epi16(a8_lo);
-            __m512i a16_hi = _mm512_cvtepi8_epi16(a8_hi);
-            __m512i vacc = _mm512_setzero_si512();
-            vacc = _mm512_dpwssd_epi32(vacc, w16_lo, a16_lo);
-            vacc = _mm512_dpwssd_epi32(vacc, w16_hi, a16_hi);
-            acc += _mm512_reduce_add_epi32(vacc);
+        for (int ib = 0; ib < 4; ib++) {
+            const uint16_t *qsb = qs  + ib * 8;
+            const int8_t  *a8b = a8  + ib * 64;
+
+            /* Load 64 activation int8 values as two 32-int16 vectors */
+            __m256i a8_lo_v = _mm256_loadu_si256((const __m256i*)(a8b));
+            __m256i a8_hi_v = _mm256_loadu_si256((const __m256i*)(a8b + 32));
+            __m512i a16_lo = _mm512_cvtepi8_epi16(a8_lo_v);
+            __m512i a16_hi = _mm512_cvtepi8_epi16(a8_hi_v);
+
+            /* Process all 8 qs entries as one 64-weight batch.
+             * Grid indices from qsb[0,1,4,5]; signs from qsb[2,3,6,7].
+             * Lower 32 weights (sg0..sg3) × lower 32 activations × lsL.
+             * Upper 32 weights (sg4..sg7) × upper 32 activations × lsU. */
+            {
+                uint32_t aux32[4];
+                memcpy(aux32, qsb, 16);  /* qsb[0..3] */
+                const uint8_t *auxL = (const uint8_t*)aux32;
+
+                /* 4 grid indices for lower half */
+                __m128i g0 = _mm_loadl_epi64((const __m128i*)(iq2xxs_grid + auxL[0]));
+                __m128i g1 = _mm_loadl_epi64((const __m128i*)(iq2xxs_grid + auxL[1]));
+                __m128i g2 = _mm_loadl_epi64((const __m128i*)(iq2xxs_grid + auxL[2]));
+                __m128i g3 = _mm_loadl_epi64((const __m128i*)(iq2xxs_grid + auxL[3]));
+
+                /* Sign indices from aux32[1] = qsb[2]|(qsb[3]<<16) */
+                uint32_t aL = aux32[1];
+                __m128i s0 = _mm_loadl_epi64((const __m128i*)iq2xxs_signs[(aL >> 0) & 127]);
+                __m128i s1 = _mm_loadl_epi64((const __m128i*)iq2xxs_signs[(aL >> 7) & 127]);
+                __m128i s2 = _mm_loadl_epi64((const __m128i*)iq2xxs_signs[(aL >> 14) & 127]);
+                __m128i s3 = _mm_loadl_epi64((const __m128i*)iq2xxs_signs[(aL >> 21) & 127]);
+
+                /* Lower 32 signed weights — pack as 32 int8 into __m256i */
+                __m128i sg0 = _mm_sign_epi8(g0, s0), sg1 = _mm_sign_epi8(g1, s1);
+                __m128i sg2 = _mm_sign_epi8(g2, s2), sg3 = _mm_sign_epi8(g3, s3);
+                int8_t w32[32] __attribute__((aligned(32)));
+                memcpy(w32,      &sg0, 8); memcpy(w32 + 8,  &sg1, 8);
+                memcpy(w32 + 16, &sg2, 8); memcpy(w32 + 24, &sg3, 8);
+                __m256i w32v = _mm256_load_si256((const __m256i*)w32);
+                __m512i w16_lo0 = _mm512_cvtepi8_epi16(w32v);
+
+                /* Scale for lower 32 weights: qsb[3] bits 12-15 */
+                int lsL = 2 * (int)(aL >> 28) + 1;
+                __m512i vlsL = _mm512_set1_epi32(lsL);
+
+                /* Use madd+mullo (matches CPU exactly) */
+                __m512i prodL = _mm512_madd_epi16(w16_lo0, a16_lo);
+                __m512i scaledL = _mm512_mullo_epi32(prodL, vlsL);
+                sumf += dw * q8_d * (float)_mm512_reduce_add_epi32(scaledL);
+
+                /* Now upper half from qsb[4..7] */
+                memcpy(aux32, qsb + 4, 16);
+                const uint8_t *auxU = (const uint8_t*)aux32;
+
+                __m128i g4 = _mm_loadl_epi64((const __m128i*)(iq2xxs_grid + auxU[0]));
+                __m128i g5 = _mm_loadl_epi64((const __m128i*)(iq2xxs_grid + auxU[1]));
+                __m128i g6 = _mm_loadl_epi64((const __m128i*)(iq2xxs_grid + auxU[2]));
+                __m128i g7 = _mm_loadl_epi64((const __m128i*)(iq2xxs_grid + auxU[3]));
+
+                uint32_t aU = aux32[1];
+                __m128i u0 = _mm_loadl_epi64((const __m128i*)iq2xxs_signs[(aU >> 0) & 127]);
+                __m128i u1 = _mm_loadl_epi64((const __m128i*)iq2xxs_signs[(aU >> 7) & 127]);
+                __m128i u2 = _mm_loadl_epi64((const __m128i*)iq2xxs_signs[(aU >> 14) & 127]);
+                __m128i u3 = _mm_loadl_epi64((const __m128i*)iq2xxs_signs[(aU >> 21) & 127]);
+
+                __m128i sg4 = _mm_sign_epi8(g4, u0), sg5 = _mm_sign_epi8(g5, u1);
+                __m128i sg6 = _mm_sign_epi8(g6, u2), sg7 = _mm_sign_epi8(g7, u3);
+                int8_t w32u[32] __attribute__((aligned(32)));
+                memcpy(w32u,       &sg4, 8); memcpy(w32u + 8,  &sg5, 8);
+                memcpy(w32u + 16,  &sg6, 8); memcpy(w32u + 24, &sg7, 8);
+                __m256i w32uv = _mm256_load_si256((const __m256i*)w32u);
+                __m512i w16_up0 = _mm512_cvtepi8_epi16(w32uv);
+
+                int lsU = 2 * (int)(aU >> 28) + 1;
+                __m512i vlsU = _mm512_set1_epi32(lsU);
+
+                __m512i prodU = _mm512_madd_epi16(w16_up0, a16_hi);
+                __m512i scaledU = _mm512_mullo_epi32(prodU, vlsU);
+                sumf += dw * q8_d * (float)_mm512_reduce_add_epi32(scaledU);
+            }
         }
-        sumf += d * (float)acc;
     }
     *s += sumf;
 }
