@@ -6481,6 +6481,30 @@ static void layer_ffn_one(
     free(ffn_cur);
 }
 
+/* Q8_K gate/up worker for ds4_parallel_for */
+typedef struct {
+    float *restrict gate_out, *restrict up_out;
+    const uint8_t *gate_blocks, *up_blocks;
+    uint64_t row_bytes;
+    const int8_t *act_q8;
+    const float *act_scale;
+} gateup_q8k_ctx;
+
+static void gateup_q8k_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    gateup_q8k_ctx *ctx = (gateup_q8k_ctx*)vctx;
+    for (uint64_t r = row0; r < row1; r++) {
+        float gd = 0, ud = 0;
+        ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(DS4_N_EMBD, &gd,
+            (const ds4_xeon_block_iq2_xxs*)(ctx->gate_blocks + r * ctx->row_bytes),
+            ctx->act_q8, ctx->act_scale);
+        ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(DS4_N_EMBD, &ud,
+            (const ds4_xeon_block_iq2_xxs*)(ctx->up_blocks + r * ctx->row_bytes),
+            ctx->act_q8, ctx->act_scale);
+        ctx->gate_out[r] = gd;
+        ctx->up_out[r] = ud;
+    }
+}
+
 /* Q8_K down worker for ds4_parallel_for */
 typedef struct {
     float *restrict out;
@@ -6567,15 +6591,15 @@ static void layer_ffn_one_decode_scratch(
         const uint8_t *ubase = (const uint8_t*)tensor_data(model, layer->ffn_up_exps);
         for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
             float cg[DS4_N_FF_EXP], cu[DS4_N_FF_EXP];
-            const uint8_t *ge = gbase + (uint64_t)sel[ei] * DS4_N_FF_EXP * grb;
-            const uint8_t *ue = ubase + (uint64_t)sel[ei] * DS4_N_FF_EXP * grb;
-            for (uint32_t r = 0; r < DS4_N_FF_EXP; r++) {
-                float gd = 0, ud = 0;
-                ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(DS4_N_EMBD, &gd,
-                    (const ds4_xeon_block_iq2_xxs*)(ge + r*grb), a8f, a8s);
-                ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(DS4_N_EMBD, &ud,
-                    (const ds4_xeon_block_iq2_xxs*)(ue + r*grb), a8f, a8s);
-                cg[r] = gd; cu[r] = ud;
+            {
+                gateup_q8k_ctx gctx = {
+                    .gate_out = cg, .up_out = cu,
+                    .gate_blocks = gbase + (uint64_t)sel[ei] * DS4_N_FF_EXP * grb,
+                    .up_blocks   = ubase + (uint64_t)sel[ei] * DS4_N_FF_EXP * grb,
+                    .row_bytes = grb,
+                    .act_q8 = a8f, .act_scale = a8s,
+                };
+                ds4_parallel_for(DS4_N_FF_EXP, gateup_q8k_worker, &gctx);
             }
             /* SwiGLU */
             for (int j = 0; j < DS4_N_FF_EXP; j++) {
