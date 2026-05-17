@@ -16682,156 +16682,9 @@ static void q80_worker(void *vctx, uint64_t row0, uint64_t row1) {
         ctx->q80_blocks, ctx->in_dim, (int)row0, (int)row1);
 }
 
-/* A/B comparison: CPU MoE vs VNNI MoE for layer 0, enabled by
- * DS4_XEON_AB_TEST=1.  Runs both paths on the same FFN input and
- * prints per-element statistics. */
-static void ds4_xeon_ffn_ab_compare(
-        float                  * out_hc,
-        const ds4_model        * model,
-        const ds4_layer_weights * layer,
-        const float            * inp_hc,
-        uint32_t                 il,
-        int                      token,
-        ds4_cpu_decode_scratch * scratch)
-{
-    /* --- HC pre + RMS norm (mirrors layer_ffn_one_decode_scratch) --- */
-    float post[4], comb[16];
-    hc_pre_from_state_one_scratch(model,
-        layer->hc_ffn_fn, layer->hc_ffn_scale, layer->hc_ffn_base,
-        inp_hc, scratch->ffn_cur, post, comb,
-        scratch->hc_flat, false);
-    const float *ffn_norm_w = tensor_data(model, layer->ffn_norm);
-    rms_norm_weight(scratch->ffn_norm, scratch->ffn_cur,
-        ffn_norm_w, DS4_N_EMBD, DS4_RMS_EPS);
-
-    /* Save ffn_norm — the MoE input */
-    float saved_norm[DS4_N_EMBD];
-    memcpy(saved_norm, scratch->ffn_norm, sizeof(saved_norm));
-
-    /* --- Router --- */
-    int selected[DS4_N_EXPERT_USED];
-    float expert_weight[DS4_N_EXPERT_USED];
-    if (layer->ffn_gate_tid2eid) {
-        layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer,
-            saved_norm, selected);
-    } else {
-        layer_topk_selected_experts(selected, expert_weight,
-            model, layer, saved_norm);
-    }
-
-    /* --- CPU MoE (trace style, per-expert) --- */
-    float cpu_moe[DS4_N_EMBD];
-    float cpu_gate0 = 0.0f; /* first row of first expert gate, for debug */
-    memset(cpu_moe, 0, sizeof(cpu_moe));
-    {
-        block_q8_K *xq = scratch->routed_xq;
-        ds4_quantize_row_q8_K(saved_norm, xq, (int64_t)DS4_N_EMBD);
-        for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
-            int eid = selected[ei];
-            float ew = expert_weight[ei];
-            float gate[DS4_N_FF_EXP], up[DS4_N_FF_EXP];
-            matvec_iq2_xxs_expert_pair_prequant(gate, up, model,
-                layer->ffn_gate_exps, layer->ffn_up_exps, xq,
-                (uint32_t)eid);
-            if (ei == 0) cpu_gate0 = gate[0];
-            /* SwiGLU: mid = SiLU(gate) * up */
-            for (int j = 0; j < DS4_N_FF_EXP; j++) {
-                float g = gate[j];
-                float si = 1.0f / (1.0f + expf(-g));
-                gate[j] = si * g * up[j];  /* gate[] → mid */
-            }
-            block_q8_K *midq = scratch->routed_midq
-                + (uint64_t)ei * (DS4_N_FF_EXP / QK_K);
-            ds4_quantize_row_q8_K(gate, midq, (int64_t)DS4_N_FF_EXP);
-            float down_out[DS4_N_EMBD];
-            memset(down_out, 0, sizeof(down_out));
-            int eid_arr[1] = {eid};
-            matvec_q2_k_experts_accum_prequant(down_out, model,
-                layer->ffn_down_exps, midq, eid_arr, 1);
-            for (int j = 0; j < DS4_N_EMBD; j++)
-                cpu_moe[j] += ew * down_out[j];
-        }
-    }
-
-    /* --- VNNI gate[0] comparison (independent of full MoE) --- */
-    {
-        int eid0 = selected[0];
-        const uint64_t grb = 66ULL * (DS4_N_EMBD / QK_K);
-        const uint8_t *gb = (const uint8_t*)tensor_data(
-            model, layer->ffn_gate_exps)
-            + (uint64_t)eid0 * DS4_N_FF_EXP * grb;
-        int16_t a16[DS4_N_EMBD] __attribute__((aligned(64)));
-        float a16_sc;
-        ds4_xeon_quantize_a16_per_token(a16, &a16_sc, saved_norm, 1, DS4_N_EMBD);
-        float vnni_gate0 = 0.0f;
-        ds4_xeon_vec_dot_iq2_xxs_vnni(DS4_N_EMBD, &vnni_gate0,
-            (const ds4_xeon_block_iq2_xxs*)gb, a16, a16_sc);
-        fprintf(stderr, "ds4: [AB l%u] eid=%d gate[0] cpu=%.6e vnni=%.6e diff=%.2e\n",
-            il, eid0, (double)cpu_gate0, (double)vnni_gate0,
-            fabs((double)cpu_gate0 - (double)vnni_gate0));
-    }
-
-    /* --- VNNI MoE (per-expert, on-the-fly) --- */
-    float vnni_moe[DS4_N_EMBD];
-    memset(vnni_moe, 0, sizeof(vnni_moe));
-    {
-        const uint64_t gate_row_bytes =
-            66ULL * (DS4_N_EMBD / DS4_XEON_QK_K);
-        const uint64_t up_row_bytes = gate_row_bytes;
-        const uint64_t down_row_bytes =
-            84ULL * (DS4_N_FF_EXP / DS4_XEON_QK_K);
-        const uint8_t *gate_base = (const uint8_t*)tensor_data(
-            model, layer->ffn_gate_exps);
-        const uint8_t *up_base = (const uint8_t*)tensor_data(
-            model, layer->ffn_up_exps);
-        const uint8_t *down_base = (const uint8_t*)tensor_data(
-            model, layer->ffn_down_exps);
-
-        for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
-            int eid = selected[ei];
-            float ew = expert_weight[ei];
-            const uint8_t *gate_blocks = gate_base
-                + (uint64_t)eid * DS4_N_FF_EXP * gate_row_bytes;
-            const uint8_t *up_blocks = up_base
-                + (uint64_t)eid * DS4_N_FF_EXP * up_row_bytes;
-            const uint8_t *down_blocks = down_base
-                + (uint64_t)eid * DS4_N_EMBD * down_row_bytes;
-            ds4_xeon_routed_moe_one_expert(vnni_moe, saved_norm,
-                gate_blocks, up_blocks, down_blocks,
-                gate_row_bytes, up_row_bytes, down_row_bytes, ew);
-        }
-    }
-
-    /* --- Compare CPU vs VNNI MoE output --- */
-    double max_rel = 0, sum_rel = 0, max_abs = 0;
-    int max_idx = 0;
-    for (int i = 0; i < DS4_N_EMBD; i++) {
-        double err = fabs((double)cpu_moe[i] - (double)vnni_moe[i]);
-        double mag = fabs((double)cpu_moe[i])
-                   + fabs((double)vnni_moe[i]) + 1e-10;
-        double rel = err / mag;
-        sum_rel += rel;
-        if (err > max_abs) max_abs = err;
-        if (rel > max_rel) { max_rel = rel; max_idx = i; }
-    }
-    fprintf(stderr,
-        "ds4: [AB l%u] ffn_moe: avg_rel=%.4e max_rel=%.4e@%d "
-        "max_abs=%.4e cpu=%.4e vnni=%.4e  (N_EMBD=%d, n_sel=%d)\n",
-        il, sum_rel / DS4_N_EMBD, max_rel, max_idx,
-        max_abs, (double)cpu_moe[max_idx], (double)vnni_moe[max_idx],
-        DS4_N_EMBD, DS4_N_EXPERT_USED);
-
-    /* Print per-element values for the first 8 elements */
-    fprintf(stderr, "ds4: [AB l%u] first 8: ", il);
-    for (int i = 0; i < 8; i++)
-        fprintf(stderr, "cpu[%d]=%.4f vnni[%d]=%.4f  ",
-            i, (double)cpu_moe[i], i, (double)vnni_moe[i]);
-    fprintf(stderr, "\n");
-
-    (void)out_hc;
-}
-
+/* Xeon decode: single token through all layers.
+ * CPU attention + parallel on-the-fly VNNI MoE via ds4_parallel_for.
+ * This is the hot path called from ds4_session_sync for incremental decode. */
 static void ds4_xeon_decode_token(
         float             * logits,
         ds4_engine        * e,
@@ -16839,97 +16692,18 @@ static void ds4_xeon_decode_token(
         int                 token,
         uint32_t            pos)
 {
-    ds4_cpu_decode_scratch *scratch = &s->cpu_scratch;
-    float *cur = scratch->cur;
-    float *next = scratch->next;
-
-    embed_token_f16(&e->model, &e->weights, token, scratch->plain);
-    hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
-
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_weights *lw = &e->weights.layer[il];
-        ds4_layer_cache *cache = &s->cpu_cache.layer[il];
-
-        /* === CPU Attention (exact copy from layer_forward_raw_swa_one) === */
-        float post[4], comb[16];
-        memcpy(scratch->attn_residual, cur,
-               sizeof(float) * DS4_N_HC * DS4_N_EMBD);
-        hc_pre_from_state_one_scratch(&e->model,
-            lw->hc_attn_fn, lw->hc_attn_scale, lw->hc_attn_base,
-            scratch->attn_residual, scratch->attn_cur, post, comb,
-            scratch->hc_flat, false);
-        layer_attn_norm_one(scratch->attn_norm, &e->model, lw, scratch->attn_cur);
-        const uint32_t ratio = cache->compress_ratio;
-        layer_q_projection_with_lora_one_decode_scratch(&e->model, lw,
-            scratch->attn_norm, scratch->q, scratch->qr_norm, scratch);
-        layer_kv_projection_normed_one_decode_scratch(&e->model, lw,
-            scratch->attn_norm, scratch->kv, scratch);
-        rope_tail_layer_inplace(scratch->q, DS4_N_HEAD, DS4_N_HEAD_DIM,
-            DS4_N_ROT, pos, il, false);
-        rope_tail_layer_inplace(scratch->kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-            DS4_N_ROT, pos, il, false);
-        dsv4_fp8_kv_quantize_row_inplace_cpu(scratch->kv, DS4_N_HEAD_DIM, DS4_N_ROT);
-        kv_cache_push_raw(cache, scratch->kv);
-        bool *comp_allowed = NULL;
-        if (ratio != 0) {
-            if (compressor_decode_one_decode_scratch(scratch->comp, &e->model,
-                lw->attn_compressor_kv, lw->attn_compressor_gate,
-                lw->attn_compressor_ape, lw->attn_compressor_norm,
-                scratch->attn_norm,
-                cache->attn_state_kv, cache->attn_state_score,
-                DS4_N_HEAD_DIM, ratio, il, pos, scratch)) {
-                kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp,
-                    cache->comp_cap, DS4_N_HEAD_DIM, scratch->comp);
-            }
-            if (ratio == 4) {
-                if (compressor_decode_one_decode_scratch(scratch->index_comp, &e->model,
-                    lw->indexer_compressor_kv, lw->indexer_compressor_gate,
-                    lw->indexer_compressor_ape, lw->indexer_compressor_norm,
-                    scratch->attn_norm,
-                    cache->index_state_kv, cache->index_state_score,
-                    DS4_N_INDEXER_HEAD_DIM, ratio, il, pos, scratch)) {
-                    kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp,
-                        cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, scratch->index_comp);
-                }
-            }
-        }
-        if (ratio == 4)
-            comp_allowed = indexer_allowed_decode_one_decode_scratch(&e->model, lw,
-                scratch->attn_norm, scratch->qr_norm,
-                cache->index_comp_kv, cache->n_index_comp, il, pos, scratch);
-        if (ratio != 0)
-            layer_attention_mixed_one_decode_scratch(scratch->heads, &e->model, lw,
-                scratch->q, cache->raw_kv, cache->n_raw,
-                cache->attn_comp_kv, cache->n_comp, comp_allowed, scratch);
-        else
-            layer_attention_rows_one(scratch->heads, &e->model, lw, scratch->q,
-                cache->raw_kv, cache->n_raw);
-        rope_tail_layer_inplace(scratch->heads, DS4_N_HEAD, DS4_N_HEAD_DIM,
-            DS4_N_ROT, pos, il, true);
-        layer_grouped_out_one_decode_scratch(scratch->attn_out, &e->model, lw,
-            scratch->heads, scratch);
-        hc_post_one(scratch->after_attn_hc, scratch->attn_out,
-            scratch->attn_residual, post, comb, DS4_N_EMBD, DS4_N_HC);
-
-        /* === FFN: A/B compare VNNI vs CPU (layer 0 only) === */
-        if (il == 0 && getenv("DS4_XEON_AB_TEST")) {
-            ds4_xeon_ffn_ab_compare(next, &e->model, lw,
-                scratch->after_attn_hc, il, token, scratch);
-        }
-
-        /* === FFN: CPU path (baseline) === */
-        layer_ffn_one_decode_scratch(next, &e->model, lw,
-            scratch->after_attn_hc, il, token,
-            e->directional_steering_dirs,
-            e->directional_steering_ffn_scale,
-            scratch);
-
-        { float *tmp = cur; cur = next; next = tmp; }
-    }
-
-    output_logits_one_decode_scratch(logits, &e->model, &e->weights, cur, scratch);
-    scratch->cur = cur;
-    scratch->next = next;
+    /* Delegate to CPU path for correctness baseline.
+     * VNNI optimizations will be incrementally added:
+     *   Step 1: Replace MoE FFN with VNNI (verify correctness)
+     *   Step 2: Replace attention Q/KV with VNNI (verify correctness)
+     *   Step 3: Add ds4_parallel_for parallelism (verify speed) */
+    forward_token_raw_swa_cpu_decode_scratch(logits,
+        &e->model, &e->weights, &s->cpu_cache,
+        token, pos,
+        e->directional_steering_dirs,
+        e->directional_steering_attn_scale,
+        e->directional_steering_ffn_scale,
+        &s->cpu_scratch);
 }
 
 /* Original xeon per-layer implementation kept as reference for VNNI migration.
@@ -16974,7 +16748,7 @@ static void ds4_xeon_decode_token_vnni(
             float act_scale;
             ds4_xeon_quantize_a16_per_token(act_i16, &act_scale,
                 scratch->attn_norm, 1, DS4_N_EMBD);
-            /* act_scale from quantize is max_val/32767, correct for dot */
+            act_scale = 1.0f / act_scale;
 
             /* Q down: 4096→1024 */
             float q_down[DS4_N_LORA_Q] __attribute__((aligned(64)));
@@ -17010,7 +16784,7 @@ static void ds4_xeon_decode_token_vnni(
             float act_scale;
             ds4_xeon_quantize_a16_per_token(act_i16, &act_scale,
                 scratch->attn_norm, 1, DS4_N_EMBD);
-            /* act_scale from quantize is max_val/32767, correct for dot */
+            act_scale = 1.0f / act_scale;
 
             q80_ctx ctx = {scratch->kv, act_i16, act_scale,
                 tensor_data(&e->model, lw->attn_kv), DS4_N_EMBD};
@@ -17141,7 +16915,7 @@ static void ds4_xeon_decode_token_vnni(
             float act_scale;
             ds4_xeon_quantize_a16_per_token(act_i16, &act_scale,
                 scratch->ffn_norm, 1, DS4_N_EMBD);
-            /* act_scale from quantize is max_val/32767, correct for dot */
+            act_scale = 1.0f / act_scale;
 
             /* gate: 2048 rows via ds4_parallel_for */
             gateup_ctx gctx = {gate, gate_raw, gate_rb, act_i16, act_scale};

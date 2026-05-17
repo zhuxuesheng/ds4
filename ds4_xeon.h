@@ -172,9 +172,14 @@ void ds4_xeon_vec_dot_q2_K_q8k_vnni(int n, float *s,
 void ds4_xeon_vec_dot_q2_K_vnni(int n, float *s, const ds4_xeon_block_q2_K *x,
     const int16_t *y_i16, const int32_t *y_sum_32, float scale_y);
 
-// IQ2_XXS dot product (existing, needs vectorization)
+// IQ2_XXS dot product (existing, INT16 activation)
 void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs *x,
     const int16_t *y_i16, float scale_y);
+
+// IQ2_XXS dot product with Q8_K activation (matching CPU Q8_K quantization)
+void ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(int n, float *s,
+    const ds4_xeon_block_iq2_xxs *x,
+    const int8_t *q8, const float *q8_scale);
 
 // Xeon AVX-512 routed MoE: one expert's gate→up→SiLU→down
 // out: [DS4_N_EMBD] accumulator, x: [DS4_N_EMBD] RMS-normed input

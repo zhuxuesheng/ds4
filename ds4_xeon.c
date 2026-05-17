@@ -843,23 +843,6 @@ void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs
                 mask[qi] = iq2xxs_sign_mask_lut[ksigns_iq2xs[si16[qi * 2]]];
             }
 
-            /* One-time debug: print first block details */
-            {
-                static int done = 0;
-                if (i == 0 && j == 0 && !done) {
-                    done = 1;
-                    uint16_t q0 = qs[0];
-                    uint8_t gi0 = q0 & 0xFF, si0 = (q0 >> 8) & 0x7F;
-                    uint8_t ks  = ksigns_iq2xs[si0];
-                    uint64_t gv = iq2xxs_grid[gi0];
-                    fprintf(stderr, "ds4_xeon: IQ2XXS dbg q[0]=0x%04x gi=%u si=%u "
-                        "ksigns_iq2xs[%u]=0x%02x grid[%u]=0x%016lx "
-                        "mask[0]=0x%016lx d_raw=0x%04x a16[0]=%d\n",
-                        q0, gi0, si0, si0, ks, gi0, gv, mask[0],
-                        x[i].d, (int)a16[0]);
-                }
-            }
-
             // Load raw int8 weights and negation mask
             __m512i w8_raw = _mm512_loadu_si512((const __m512i*)gl);
             __m512i m8 = _mm512_loadu_si512((const __m512i*)mask);
@@ -889,6 +872,63 @@ void ds4_xeon_vec_dot_iq2_xxs_vnni(int n, float *s, const ds4_xeon_block_iq2_xxs
         sumf += d * (float)acc;
     }
 
+    *s += sumf;
+}
+
+// ============================================================================
+// IQ2XXS VNNI with Q8_K activation — matching CPU Q8_K quantization
+// ============================================================================
+// Same as ds4_xeon_vec_dot_iq2_xxs_vnni but uses Q8_K per-block activation
+// (int8 + per-block float scale) instead of per-token INT16.  This matches
+// the CPU's ds4_vec_dot_iq2_xxs_pair_q8_K and handles negative block scales
+// that arise from ds4_quantize_row_q8_K's iscale = -127/max formula.
+void ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(int n, float *s,
+    const ds4_xeon_block_iq2_xxs *x,
+    const int8_t *q8, const float *q8_scale)
+{
+    const int nb = n / DS4_XEON_QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float q8_d = q8_scale[i];
+        const float d     = xeon_f16_to_f32(x[i].d) * q8_d;
+        const uint16_t *qs = x[i].qs;
+        const int8_t  *a8  = q8 + (uint64_t)i * DS4_XEON_QK_K;
+        int32_t acc = 0;
+
+        for (int j = 0; j < 32; j += 8) {
+            __m128i qv = _mm_loadu_si128((const __m128i*)(qs + j));
+            __m256i lo32 = _mm256_cvtepu16_epi32(
+                _mm_and_si128(qv, _mm_set1_epi16(0xFF)));
+            __m512i g64 = _mm512_i32gather_epi64(lo32,
+                (const void*)iq2xxs_grid, 8);
+            __m128i hi8 = _mm_and_si128(
+                _mm_srli_epi16(qv, 8), _mm_set1_epi16(0x7F));
+            uint64_t gl[8];
+            _mm512_storeu_si512((__m512i*)gl, g64);
+            uint8_t si16[16];
+            _mm_storeu_si128((__m128i*)si16, hi8);
+            uint64_t mask[8];
+            for (int qi = 0; qi < 8; qi++)
+                mask[qi] = iq2xxs_sign_mask_lut[ksigns_iq2xs[si16[qi * 2]]];
+            __m512i w8_raw = _mm512_loadu_si512((const __m512i*)gl);
+            __m512i m8 = _mm512_loadu_si512((const __m512i*)mask);
+            __m512i w8_signed = _mm512_sub_epi8(
+                _mm512_xor_si512(w8_raw, m8), m8);
+            __m256i w8_lo = _mm512_castsi512_si256(w8_signed);
+            __m256i w8_hi = _mm512_extracti64x4_epi64(w8_signed, 1);
+            __m512i w16_lo = _mm512_cvtepi8_epi16(w8_lo);
+            __m512i w16_hi = _mm512_cvtepi8_epi16(w8_hi);
+            __m256i a8_lo = _mm256_loadu_si256((const __m256i*)(a8 + j * 8));
+            __m256i a8_hi = _mm256_loadu_si256((const __m256i*)(a8 + j * 8 + 32));
+            __m512i a16_lo = _mm512_cvtepi8_epi16(a8_lo);
+            __m512i a16_hi = _mm512_cvtepi8_epi16(a8_hi);
+            __m512i vacc = _mm512_setzero_si512();
+            vacc = _mm512_dpwssd_epi32(vacc, w16_lo, a16_lo);
+            vacc = _mm512_dpwssd_epi32(vacc, w16_hi, a16_hi);
+            acc += _mm512_reduce_add_epi32(vacc);
+        }
+        sumf += d * (float)acc;
+    }
     *s += sumf;
 }
 
@@ -944,51 +984,86 @@ void ds4_xeon_vec_dot_q2_K_q8k_vnni(int n, float *s,
     const ds4_xeon_block_q2_K *x,
     const int8_t *q8, const float *q8_scale)
 {
+    /* This mirrors ds4_vec_dot_q2_K_q8_K from ds4.c exactly, using the
+     * same Q2_K nibble interleaving and scale nibble handling.
+     * Q2_K scales[j] split: low nibble = dot multiplier, high = bsums multiplier. */
     const int nb = n / DS4_XEON_QK_K;
     float sumf = 0.0f;
     for (int i = 0; i < nb; i++) {
         const float q8_d = q8_scale[i];
-        const float d    = xeon_f16_to_f32(x[i].d) * q8_d;
+        const float dall = xeon_f16_to_f32(x[i].d) * q8_d;
         const float dmin = xeon_f16_to_f32(x[i].dmin) * q8_d;
         const uint8_t *q2 = x[i].qs;
         const uint8_t *sc = x[i].scales;
         const int8_t  *a8 = q8 + (uint64_t)i * DS4_XEON_QK_K;
 
-        /* Pre-compute sums of 32 activation elements (8 sums per QK block) */
-        int32_t a32_sums[8];
-        for (int jj = 0; jj < 8; jj++) {
+        /* Pre-compute per-16-element sums for correction term */
+        int32_t a16_sums[16];
+        for (int jj = 0; jj < 16; jj++) {
             int32_t s = 0;
-            const int8_t *ap = a8 + (uint64_t)jj * 32;
-            for (int k = 0; k < 32; k++) s += (int32_t)ap[k];
-            a32_sums[jj] = s;
+            for (int k = 0; k < 16; k++)
+                s += (int32_t)a8[jj * 16 + k];
+            a16_sums[jj] = s;
         }
 
-        for (int j = 0; j < 16; j++) {
-            float sc_val = (float)sc[j];
-            const uint8_t *q_ptr = q2 + (uint64_t)j * 4;
+        /* summs = sum(a16_sums[j] * (sc[j] >> 4)) — matches CPU bsums correction */
+        int32_t summs = 0;
+        for (int j = 0; j < 16; j++)
+            summs += a16_sums[j] * ((int)sc[j] >> 4);
 
-            /* Expand nibbles → 16 int16 weights + extend activations */
-            int16_t q16[16] __attribute__((aligned(32)));
-            int16_t a16[16] __attribute__((aligned(32)));
-            const int8_t *a_ptr = a8 + (uint64_t)j * 16;
-            for (int k = 0; k < 16; k++) {
-                uint8_t q_byte = q_ptr[k / 4];
-                q16[k] = (int16_t)((q_byte >> ((k % 4) * 2)) & 3);
-                a16[k] = (int16_t)a_ptr[k];
-            }
+        /* Load Q2 nibble data — same 2×32 byte layout as CPU */
+        __m256i q2_bits_lo = _mm256_loadu_si256((const __m256i*)q2);
+        __m256i q2_bits_hi = _mm256_loadu_si256((const __m256i*)(q2 + 32));
+        __m512i q2_bits = _mm512_inserti64x4(
+            _mm512_castsi256_si512(q2_bits_lo), q2_bits_hi, 1);
 
-            /* VPDPWSSD: 16 int16 weights × 16 int16 activations */
-            __m256i wv = _mm256_load_si256((const __m256i*)q16);
-            __m256i av = _mm256_load_si256((const __m256i*)a16);
-            __m256i vacc = _mm256_dpwssd_epi32(_mm256_setzero_si256(), wv, av);
-            int32_t arr[8];
-            _mm256_storeu_si256((__m256i*)arr, vacc);
-            int32_t dot = arr[0] + arr[1] + arr[2] + arr[3]
-                        + arr[4] + arr[5] + arr[6] + arr[7];
+        __m512i acc = _mm512_setzero_si512();
 
-            sumf += d * sc_val * (float)dot
-                  - dmin * sc_val * (float)a32_sums[j / 2];
+        for (int j = 0; j < 4; j++) {
+            /* Load activations: 32 lower + 32 upper (matches CPU interleaving) */
+            __m256i q8_lo = _mm256_loadu_si256(
+                (const __m256i*)(a8 + j * 32));
+            __m256i q8_hi = _mm256_loadu_si256(
+                (const __m256i*)(a8 + 128 + j * 32));
+            __m512i q8_vals = _mm512_inserti64x4(
+                _mm512_castsi256_si512(q8_lo), q8_hi, 1);
+
+            /* Extract 64 unsigned byte nibbles (same as CPU) */
+            __m512i q2_vals = _mm512_and_si512(
+                _mm512_srli_epi32(q2_bits, j * 2), _mm512_set1_epi8(3));
+
+            /* maddubs: u8 × s8 → s16, pairwise sum → 32 int16 */
+            __m512i prod16 = _mm512_maddubs_epi16(q2_vals, q8_vals);
+
+            /* Scale factors: low nibble of sc[] */
+            int d0 = sc[j * 2]     & 0x0F;
+            int d1 = sc[j * 2 + 1] & 0x0F;
+            int d2 = sc[8 + j * 2] & 0x0F;
+            int d3 = sc[8 + j * 2 + 1] & 0x0F;
+            __m512i d_vals = _mm512_set_epi16(
+                d3, d3, d3, d3, d3, d3, d3, d3,
+                d2, d2, d2, d2, d2, d2, d2, d2,
+                d1, d1, d1, d1, d1, d1, d1, d1,
+                d0, d0, d0, d0, d0, d0, d0, d0);
+
+            /* VPDPWSSD replaces madd — same operation (int16×int16→int32 accum) */
+            acc = _mm512_dpwssd_epi32(acc, prod16, d_vals);
         }
+
+        /* Reduce 16 int32 accumulators to one int */
+        __m256i sum256 = _mm256_add_epi32(
+            _mm512_extracti64x4_epi64(acc, 1),
+            _mm512_castsi512_si256(acc));
+        __m128i sum128 = _mm_add_epi32(
+            _mm256_extracti128_si256(sum256, 1),
+            _mm256_castsi256_si128(sum256));
+        sum128 = _mm_add_epi32(sum128,
+            _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
+        sum128 = _mm_add_epi32(sum128,
+            _mm_shuffle_epi32(sum128, _MM_SHUFFLE(2, 3, 0, 1)));
+
+        sumf += dall * (float)_mm_cvtsi128_si32(sum128)
+              - dmin * (float)summs;
     }
     *s += sumf;
 }
@@ -1059,24 +1134,49 @@ void ds4_xeon_routed_moe_one_expert(
     float expert_weight)           // router weight for this expert
 {
     // Stack buffers (~50 KB total, well within default 8 MB stack)
-    __attribute__((aligned(64))) int16_t act_i16[DS4_N_EMBD];
+    __attribute__((aligned(64))) int8_t  act_q8[DS4_N_EMBD];
+    float   act_q8_scale[DS4_N_EMBD / DS4_XEON_QK_K];
     __attribute__((aligned(64))) float  gate[DS4_N_FF_EXP];
     __attribute__((aligned(64))) float  up[DS4_N_FF_EXP];
     __attribute__((aligned(64))) float  mid[DS4_N_FF_EXP];
     __attribute__((aligned(64))) int8_t  mid_q8[DS4_N_FF_EXP];
     float   mid_q8_scale[DS4_N_FF_EXP / DS4_XEON_QK_K];
 
-    // Quantize input to int16 for IQ2XXS dot products
-    float act_scale;
-    ds4_xeon_quantize_a16_per_token(act_i16, &act_scale, x, 1, DS4_N_EMBD);
-    /* act_scale from quantize is max_val/32767, correct for dot */
+    /* Quantize input to Q8_K — matches CPU's ds4_quantize_row_q8_K exactly.
+     * Uses iscale = -127/max, so block scale = -max/127 (can be negative). */
+    {
+        const int nb = DS4_N_EMBD / DS4_XEON_QK_K;
+        for (int b = 0; b < nb; b++) {
+            const float *src = x + b * DS4_XEON_QK_K;
+            int8_t *dst = act_q8 + b * DS4_XEON_QK_K;
+            float amax = 0.0f, max_val = 0.0f;
+            for (int i = 0; i < DS4_XEON_QK_K; i++) {
+                float ax = fabsf(src[i]);
+                if (ax > amax) { amax = ax; max_val = src[i]; }
+            }
+            if (amax == 0.0f) {
+                act_q8_scale[b] = 0.0f;
+                memset(dst, 0, DS4_XEON_QK_K);
+                continue;
+            }
+            float iscale = -127.0f / max_val;
+            for (int i = 0; i < DS4_XEON_QK_K; i++) {
+                int v = (int)lrintf(iscale * src[i]);
+                if (v > 127) v = 127;
+                if (v < -128) v = -128;
+                dst[i] = (int8_t)v;
+            }
+            act_q8_scale[b] = 1.0f / iscale;
+        }
+    }
 
-    // Gate projection: [DS4_N_EMBD] → [DS4_N_FF_EXP]  (2048 rows)
+    // Gate projection: [DS4_N_EMBD] → [DS4_N_FF_EXP] using Q8_K VNNI
     for (uint32_t r = 0; r < DS4_N_FF_EXP; r++) {
         const ds4_xeon_block_iq2_xxs *blocks =
             (const ds4_xeon_block_iq2_xxs*)(gate_blocks + r * gate_row_bytes);
         float dot = 0.0f;
-        ds4_xeon_vec_dot_iq2_xxs_vnni(DS4_N_EMBD, &dot, blocks, act_i16, act_scale);
+        ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(DS4_N_EMBD, &dot, blocks,
+            act_q8, act_q8_scale);
         gate[r] = dot;
     }
 
@@ -1085,35 +1185,39 @@ void ds4_xeon_routed_moe_one_expert(
         const ds4_xeon_block_iq2_xxs *blocks =
             (const ds4_xeon_block_iq2_xxs*)(up_blocks + r * up_row_bytes);
         float dot = 0.0f;
-        ds4_xeon_vec_dot_iq2_xxs_vnni(DS4_N_EMBD, &dot, blocks, act_i16, act_scale);
+        ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(DS4_N_EMBD, &dot, blocks,
+            act_q8, act_q8_scale);
         up[r] = dot;
     }
 
     // SwiGLU: mid = SiLU(gate) * up
     ds4_xeon_swiglu(mid, gate, up, DS4_N_FF_EXP);
 
-    // Quantize mid to Q8_K per-block (matching CPU's ds4_quantize_row_q8_K).
-    // Q8_K is required for heavy-tailed SwiGLU mid; per-token INT16 loses
-    // 12.6% accuracy (see ds4_xeon_down_test.c).
+    // Quantize mid to Q8_K per-block — exactly matching CPU's ds4_quantize_row_q8_K.
+    // Uses iscale = -127/max (NOT amax!), so block_q8_K.d = -max/127 can be negative.
     {
         const int nb = DS4_N_FF_EXP / DS4_XEON_QK_K;
         for (int b = 0; b < nb; b++) {
             const float *src = mid + b * DS4_XEON_QK_K;
             int8_t *dst = mid_q8 + b * DS4_XEON_QK_K;
-            float amax = 1e-9f;
+            float amax = 0.0f, max_val = 0.0f;
             for (int i = 0; i < DS4_XEON_QK_K; i++) {
-                float a = fabsf(src[i]);
-                if (a > amax) amax = a;
+                float ax = fabsf(src[i]);
+                if (ax > amax) { amax = ax; max_val = src[i]; }
             }
-            float d = amax / 127.0f;
-            float id = 1.0f / d;
-            mid_q8_scale[b] = d;
+            if (amax == 0.0f) {
+                mid_q8_scale[b] = 0.0f;
+                memset(dst, 0, DS4_XEON_QK_K);
+                continue;
+            }
+            float iscale = -127.0f / max_val;
             for (int i = 0; i < DS4_XEON_QK_K; i++) {
-                float v = src[i] * id;
-                if (v > 127.0f) v = 127.0f;
-                if (v < -128.0f) v = -128.0f;
-                dst[i] = (int8_t)(int32_t)v;
+                int v = (int)lrintf(iscale * src[i]);
+                if (v > 127) v = 127;
+                if (v < -128) v = -128;
+                dst[i] = (int8_t)v;
             }
+            mid_q8_scale[b] = 1.0f / iscale;  // = -max_val/127
         }
     }
 
