@@ -4530,7 +4530,7 @@ static void matvec_iq2_xxs_pair_worker(void *vctx, uint64_t row0, uint64_t row1)
 
 /* Project one routed expert's gate and up matrices.  Both are IQ2_XXS and
  * share the same Q8_K activation. */
-static void matvec_iq2_xxs_expert_pair_prequant(
+void matvec_iq2_xxs_expert_pair_prequant(
         float            *out0,
         float            *out1,
         const ds4_model  *m,
@@ -4717,7 +4717,7 @@ static void matvec_q2_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
 
 /* Accumulate all selected experts' Q2_K down projections directly into the
  * 4096-wide MoE output. */
-static void matvec_q2_k_experts_accum_prequant(
+void matvec_q2_k_experts_accum_prequant(
         float            *out,
         const ds4_model  *m,
         const ds4_tensor *w,
@@ -6519,6 +6519,53 @@ static void layer_ffn_one_decode_scratch(
     if (profile) t_norm = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
+#if defined(__x86_64__)
+    if (getenv("DS4_XEON_VNNI_MOE")) {
+        /* Hybrid MoE: CPU native gate/up/mid + VNNI Q8_K down */
+        int sel[6]; float ew[6];
+        if (layer->ffn_gate_tid2eid) {
+            layer_hash_selected_experts(sel, model, layer, token);
+            layer_hash_router_weights_one(ew, model, layer, scratch->ffn_norm, sel);
+        } else {
+            layer_topk_selected_experts(sel, ew, model, layer, scratch->ffn_norm);
+        }
+        memset(scratch->ffn_moe, 0, DS4_N_EMBD * sizeof(float));
+        block_q8_K *xq = scratch->routed_xq;
+        ds4_quantize_row_q8_K(scratch->ffn_norm, xq, (int64_t)DS4_N_EMBD);
+        for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
+            float cg[DS4_N_FF_EXP], cu[DS4_N_FF_EXP];
+            matvec_iq2_xxs_expert_pair_prequant(cg, cu, model,
+                layer->ffn_gate_exps, layer->ffn_up_exps, xq, (uint32_t)sel[ei]);
+            /* SwiGLU */
+            for (int j = 0; j < DS4_N_FF_EXP; j++) {
+                float g = cg[j];
+                cg[j] = (1.0f/(1.0f+expf(-g))) * g * cu[j];
+            }
+            /* Quantize mid via CPU */
+            block_q8_K *midq = scratch->routed_midq;
+            ds4_quantize_row_q8_K(cg, midq, (int64_t)DS4_N_FF_EXP);
+            /* VNNI down: extract int8+scales from block_q8_K */
+            const int nbd = DS4_N_FF_EXP / QK_K;
+            int8_t  mq8[DS4_N_FF_EXP] __attribute__((aligned(64)));
+            float   mqs[nbd];
+            for (int b = 0; b < nbd; b++) {
+                mqs[b] = midq[b].d;
+                memcpy(mq8 + b * QK_K, midq[b].qs, QK_K);
+            }
+            const uint64_t drb = 84ULL * (DS4_N_FF_EXP / QK_K);
+            const uint8_t *down_base = (const uint8_t*)tensor_data(
+                model, layer->ffn_down_exps);
+            const uint8_t *de = down_base + (uint64_t)sel[ei] * DS4_N_EMBD * drb;
+            for (uint32_t r = 0; r < DS4_N_EMBD; r++) {
+                float d = 0;
+                const ds4_xeon_block_q2_K *blk =
+                    (const ds4_xeon_block_q2_K*)(de + r * drb);
+                ds4_xeon_vec_dot_q2_K_q8k_vnni(DS4_N_FF_EXP, &d, blk, mq8, mqs);
+                scratch->ffn_moe[r] += ew[ei] * d;
+            }
+        }
+    } else
+#endif
     layer_routed_moe_one_prealloc(scratch->ffn_moe,
                                   model,
                                   layer,
