@@ -6524,7 +6524,34 @@ static void gateup_q8k_worker(void *vctx, uint64_t row0, uint64_t row1) {
     }
 }
 
-/* Q8_K down worker for ds4_parallel_for */
+/* Batched Q8_K down worker: processes ALL experts in one dispatch */
+typedef struct {
+    float *restrict out;
+    const uint8_t *down_blocks[DS4_N_EXPERT_USED];
+    uint64_t row_bytes;
+    const int8_t *mid_q8[DS4_N_EXPERT_USED];
+    const float *mid_scale[DS4_N_EXPERT_USED];
+    float ew[DS4_N_EXPERT_USED];
+    int n_ff;
+} down_batch_ctx;
+
+static void down_batch_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    down_batch_ctx *ctx = (down_batch_ctx*)vctx;
+    for (uint64_t r = row0; r < row1; r++) {
+        float acc = 0.0f;
+        for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
+            const ds4_xeon_block_q2_K *blk =
+                (const ds4_xeon_block_q2_K*)(ctx->down_blocks[ei] + r * ctx->row_bytes);
+            float d = 0.0f;
+            ds4_xeon_vec_dot_q2_K_q8k_vnni(ctx->n_ff, &d, blk,
+                ctx->mid_q8[ei], ctx->mid_scale[ei]);
+            acc += ctx->ew[ei] * d;
+        }
+        ctx->out[r] += acc;
+    }
+}
+
+/* Q8_K down worker for ds4_parallel_for (single expert, unused if batched) */
 typedef struct {
     float *restrict out;
     const uint8_t *down_blocks;
@@ -6598,40 +6625,49 @@ static void layer_ffn_one_decode_scratch(
         memset(scratch->ffn_moe, 0, DS4_N_EMBD * sizeof(float));
         block_q8_K *xq = scratch->routed_xq;
         ds4_quantize_row_q8_K(scratch->ffn_norm, xq, (int64_t)DS4_N_EMBD);
+        /* Gate/up + mid for all experts */
+        const int nbd = DS4_N_FF_EXP / QK_K;
+        const uint64_t drb = 84ULL * (DS4_N_FF_EXP / QK_K);
+        const uint8_t *down_base_all = (const uint8_t*)tensor_data(
+            model, layer->ffn_down_exps);
+        int8_t  *mq8_all[DS4_N_EXPERT_USED];
+        float   *mqs_all[DS4_N_EXPERT_USED];
+        const uint8_t *de_all[DS4_N_EXPERT_USED];
         for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
             float cg[DS4_N_FF_EXP], cu[DS4_N_FF_EXP];
-            /* CPU native gate/up (already parallel via ds4_parallel_for) */
             matvec_iq2_xxs_expert_pair_prequant(cg, cu, model,
                 layer->ffn_gate_exps, layer->ffn_up_exps, xq, (uint32_t)sel[ei]);
-            /* SwiGLU */
             for (int j = 0; j < DS4_N_FF_EXP; j++) {
                 float g = cg[j];
                 cg[j] = (1.0f/(1.0f+expf(-g))) * g * cu[j];
             }
-            /* Quantize mid via CPU */
-            block_q8_K *midq = scratch->routed_midq;
+            block_q8_K *midq = scratch->routed_midq
+                + (uint64_t)ei * nbd;
             ds4_quantize_row_q8_K(cg, midq, (int64_t)DS4_N_FF_EXP);
-            /* VNNI down: extract int8+scales from block_q8_K */
-            const int nbd = DS4_N_FF_EXP / QK_K;
-            int8_t  mq8[DS4_N_FF_EXP] __attribute__((aligned(64)));
-            float   mqs[nbd];
+            mq8_all[ei] = (int8_t*)aligned_alloc(64, DS4_N_FF_EXP);
+            mqs_all[ei] = (float*)aligned_alloc(64, nbd * sizeof(float));
             for (int b = 0; b < nbd; b++) {
-                mqs[b] = midq[b].d;
-                memcpy(mq8 + b * QK_K, midq[b].qs, QK_K);
+                mqs_all[ei][b] = midq[b].d;
+                memcpy(mq8_all[ei] + b * QK_K, midq[b].qs, QK_K);
             }
-            const uint64_t drb = 84ULL * (DS4_N_FF_EXP / QK_K);
-            const uint8_t *down_base = (const uint8_t*)tensor_data(
-                model, layer->ffn_down_exps);
-            const uint8_t *de = down_base + (uint64_t)sel[ei] * DS4_N_EMBD * drb;
-            {
-                down_q8k_ctx dctx = {
-                    .out = scratch->ffn_moe,
-                    .down_blocks = de, .row_bytes = drb,
-                    .mid_q8 = mq8, .mid_scale = mqs,
-                    .ew = ew[ei], .n_ff = DS4_N_FF_EXP,
-                };
-                ds4_parallel_for(DS4_N_EMBD, down_q8k_worker, &dctx);
+            de_all[ei] = down_base_all + (uint64_t)sel[ei] * DS4_N_EMBD * drb;
+        }
+        /* Batched VNNI down: one ds4_parallel_for for all experts */
+        {
+            down_batch_ctx bctx = {
+                .out = scratch->ffn_moe,
+                .row_bytes = drb, .n_ff = DS4_N_FF_EXP,
+            };
+            for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
+                bctx.down_blocks[ei] = de_all[ei];
+                bctx.mid_q8[ei] = mq8_all[ei];
+                bctx.mid_scale[ei] = mqs_all[ei];
+                bctx.ew[ei] = ew[ei];
             }
+            ds4_parallel_for(DS4_N_EMBD, down_batch_worker, &bctx);
+        }
+        for (int ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
+            free(mq8_all[ei]); free(mqs_all[ei]);
         }
     } else
 #endif
