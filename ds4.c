@@ -307,7 +307,7 @@ const uint64_t iq2xxs_grid[256] = {
 };
 
 static int8_t iq2xxs_signed_grid[256][128][8];
-static int8_t iq2xxs_signs[128][8];
+int8_t iq2xxs_signs[128][8];
 static pthread_once_t iq2xxs_signed_grid_once = PTHREAD_ONCE_INIT;
 
 static void iq2xxs_signed_grid_init(void) {

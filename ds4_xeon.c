@@ -903,6 +903,7 @@ void ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(int n, float *s,
         const float dw   = xeon_f16_to_f32(x[i].d);
         const uint16_t *qs = x[i].qs;
         const int8_t  *a8  = q8 + (uint64_t)i * DS4_XEON_QK_K;
+        int32_t block_acc = 0;  /* accumulate over 4 batches, then scale once */
 
         for (int ib = 0; ib < 4; ib++) {
             const uint16_t *qsb = qs  + ib * 8;
@@ -952,7 +953,7 @@ void ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(int n, float *s,
                 /* Use madd+mullo (matches CPU exactly) */
                 __m512i prodL = _mm512_madd_epi16(w16_lo0, a16_lo);
                 __m512i scaledL = _mm512_mullo_epi32(prodL, vlsL);
-                sumf += dw * q8_d * (float)_mm512_reduce_add_epi32(scaledL);
+                block_acc += _mm512_reduce_add_epi32(scaledL);
 
                 /* Now upper half from qsb[4..7] */
                 memcpy(aux32, qsb + 4, 16);
@@ -982,8 +983,130 @@ void ds4_xeon_vec_dot_iq2_xxs_q8k_vnni(int n, float *s,
 
                 __m512i prodU = _mm512_madd_epi16(w16_up0, a16_hi);
                 __m512i scaledU = _mm512_mullo_epi32(prodU, vlsU);
-                sumf += dw * q8_d * (float)_mm512_reduce_add_epi32(scaledU);
+                block_acc += _mm512_reduce_add_epi32(scaledU);
             }
+        }
+        sumf += dw * q8_d * (float)block_acc;
+    }
+    /* Verify against CPU scalar (first call only) */
+    static int vrfy = 0;
+    if (!vrfy && nb > 0) {
+        vrfy = 1;
+        float cpu_s = 0;
+        const uint16_t *qsc = x[0].qs;
+        const int8_t *a8c = q8;
+        const float q8dc = q8_scale[0];
+        const float dwc = xeon_f16_to_f32(x[0].d);
+        int32_t cpu_ib_acc = 0;
+        for (int ib = 0; ib < 4; ib++) {
+            uint32_t aux32[4];
+            memcpy(aux32, qsc + ib*8, 16);
+            const uint8_t *aux8 = (const uint8_t*)aux32;
+            int lsL = 2 * ((int)(aux32[1] >> 28)) + 1;
+            int32_t dotL = 0;
+            for (int gi = 0; gi < 4; gi++) {
+                uint64_t gv = iq2xxs_grid[aux8[gi]];
+                int si = (int)((aux32[1] >> (gi * 7)) & 127);
+                const int8_t *sn = iq2xxs_signs[si];
+                int8_t sg[8]; memcpy(sg, &gv, 8);
+                for (int k = 0; k < 8; k++)
+                    dotL += (int32_t)(sg[k] * sn[k]) * (int32_t)a8c[ib*64 + gi*8 + k];
+            }
+            cpu_ib_acc += lsL * dotL;
+            /* upper */
+            memcpy(aux32, qsc + ib*8 + 4, 16);
+            const uint8_t *aux8u = (const uint8_t*)aux32;
+            int lsU = 2 * ((int)(aux32[1] >> 28)) + 1;
+            int32_t dotU = 0;
+            for (int gi = 0; gi < 4; gi++) {
+                uint64_t gv = iq2xxs_grid[aux8u[gi]];
+                int si = (int)((aux32[1] >> (gi * 7)) & 127);
+                const int8_t *sn = iq2xxs_signs[si];
+                int8_t sg[8]; memcpy(sg, &gv, 8);
+                for (int k = 0; k < 8; k++)
+                    dotU += (int32_t)(sg[k] * sn[k]) * (int32_t)a8c[ib*64 + 32 + gi*8 + k];
+            }
+            cpu_ib_acc += lsU * dotU;
+        }
+        cpu_s = dwc * q8dc * (float)cpu_ib_acc;
+        fprintf(stderr, "ds4_xeon: IQ2XXS check: vnni=%.6e scalar=%.6e nb=%d ib=4 "
+            "dw=%.6e q8d=%.6e\n",
+            (double)sumf, (double)cpu_s, nb,
+            (double)dwc, (double)q8dc);
+        /* Per-batch breakdown */
+        for (int ib = 0; ib < 4; ib++) {
+            float vnni_b = 0, scalar_b = 0;
+            /* VNNI recompute per batch */
+            {
+                const uint16_t *qsb = x[0].qs + ib*8;
+                const int8_t *a8b = q8 + ib*64;
+                __m256i a8lv = _mm256_loadu_si256((const __m256i*)(a8b));
+                __m256i a8hv = _mm256_loadu_si256((const __m256i*)(a8b+32));
+                __m512i a16l = _mm512_cvtepi8_epi16(a8lv);
+                __m512i a16h = _mm512_cvtepi8_epi16(a8hv);
+                /* lower */
+                uint32_t aux32[4];
+                memcpy(aux32, qsb, 16);
+                float scl = dwc*q8dc*(float)(2*((int)(aux32[1]>>28))+1);
+                int8_t w32[32] __attribute__((aligned(32)));
+                for (int gi=0;gi<4;gi++){
+                    int si=(aux32[1]>>(gi*7))&127;
+                    uint64_t gv=iq2xxs_grid[((const uint8_t*)aux32)[gi]];
+                    __m128i g=_mm_loadl_epi64((const __m128i*)&gv);
+                    __m128i s=_mm_loadl_epi64((const __m128i*)iq2xxs_signs[si]);
+                    __m128i sg=_mm_sign_epi8(g,s);
+                    memcpy(w32+gi*8, &sg, 8);
+                }
+                __m256i wv=_mm256_load_si256((const __m256i*)w32);
+                __m512i w16=_mm512_cvtepi8_epi16(wv);
+                __m512i p=_mm512_madd_epi16(w16,a16l);
+                vnni_b+=scl*(float)_mm512_reduce_add_epi32(p);
+                /* upper */
+                memcpy(aux32, qsb+4, 16);
+                float scu = dwc*q8dc*(float)(2*((int)(aux32[1]>>28))+1);
+                for (int gi=0;gi<4;gi++){
+                    int si=(aux32[1]>>(gi*7))&127;
+                    uint64_t gv=iq2xxs_grid[((const uint8_t*)aux32)[gi]];
+                    __m128i g=_mm_loadl_epi64((const __m128i*)&gv);
+                    __m128i s=_mm_loadl_epi64((const __m128i*)iq2xxs_signs[si]);
+                    __m128i sg=_mm_sign_epi8(g,s);
+                    memcpy(w32+gi*8, &sg, 8);
+                }
+                __m256i wvu=_mm256_load_si256((const __m256i*)w32);
+                __m512i w16u=_mm512_cvtepi8_epi16(wvu);
+                __m512i pu=_mm512_madd_epi16(w16u,a16h);
+                vnni_b+=scu*(float)_mm512_reduce_add_epi32(pu);
+            }
+            /* Scalar recompute per batch */
+            {
+                uint32_t aux32[4];
+                memcpy(aux32, x[0].qs + ib*8, 16);
+                const uint8_t *aux8 = (const uint8_t*)aux32;
+                int lsL = 2*((int)(aux32[1]>>28))+1;
+                int32_t dotL=0;
+                for (int gi=0;gi<4;gi++){
+                    uint64_t gv=iq2xxs_grid[aux8[gi]];
+                    int8_t sg[8]; memcpy(sg,&gv,8);
+                    int si=(int)((aux32[1]>>(gi*7))&127);
+                    const int8_t *sn=iq2xxs_signs[si];
+                    for (int k=0;k<8;k++) dotL+=(int32_t)(sg[k]*sn[k])*(int32_t)q8[ib*64+gi*8+k];
+                }
+                scalar_b += dwc*q8dc*(float)lsL*(float)dotL;
+                memcpy(aux32, x[0].qs + ib*8 + 4, 16);
+                const uint8_t *aux8u=(const uint8_t*)aux32;
+                int lsU=2*((int)(aux32[1]>>28))+1;
+                int32_t dotU=0;
+                for (int gi=0;gi<4;gi++){
+                    uint64_t gv=iq2xxs_grid[aux8u[gi]];
+                    int8_t sg[8]; memcpy(sg,&gv,8);
+                    int si=(int)((aux32[1]>>(gi*7))&127);
+                    const int8_t *sn=iq2xxs_signs[si];
+                    for (int k=0;k<8;k++) dotU+=(int32_t)(sg[k]*sn[k])*(int32_t)q8[ib*64+32+gi*8+k];
+                }
+                scalar_b += dwc*q8dc*(float)lsU*(float)dotU;
+            }
+            fprintf(stderr, "ds4_xeon:   ib=%d vnni_b=%.6e scalar_b=%.6e\n",
+                ib, (double)vnni_b, (double)scalar_b);
         }
     }
     *s += sumf;
@@ -1278,6 +1401,15 @@ void ds4_xeon_routed_moe_one_expert(
         }
     }
 
+    static int ddbg = 0;
+    if (!ddbg) {
+        fprintf(stderr, "ds4_xeon: down: mid_sc[0]=%.6e mid_q8[0]=%d down_d[0]=0x%04x "
+            "ew=%.6e n_embd=%d n_ff=%d\n",
+            (double)mid_q8_scale[0], (int)mid_q8[0],
+            ((const uint16_t*)down_blocks)[0], (double)expert_weight,
+            DS4_N_EMBD, DS4_N_FF_EXP);
+        ddbg = 1;
+    }
     // Down projection: [DS4_N_FF_EXP] → [DS4_N_EMBD], Q8_K VNNI (0.02% error)
     for (uint32_t r = 0; r < DS4_N_EMBD; r++) {
         const ds4_xeon_block_q2_K *blocks =
